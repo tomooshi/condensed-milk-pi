@@ -42,7 +42,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     compressedCount = 0;
     totalCommands = 0;
     const cmds = registeredCommands();
-    ctx.ui?.setStatus?.("token-savings", `↓0 saved (${cmds.length} filters)`);
+    ctx.ui?.setStatus?.("token-savings", `↓0 (${cmds.length}f)`);
   });
 
   pi.on("tool_result", async (event, _ctx) => {
@@ -77,7 +77,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     const pct = totalOriginal > 0 ? Math.round((totalSaved / totalOriginal) * 100) : 0;
     _ctx.ui?.setStatus?.(
       "token-savings",
-      `↓${formatBytes(totalSaved)} saved (${compressedCount}/${totalCommands} cmds, ${pct}%)`,
+      `↓${formatBytes(totalSaved)} ${compressedCount}/${totalCommands} ${pct}%`,
     );
 
     const ret: Record<string, unknown> = {

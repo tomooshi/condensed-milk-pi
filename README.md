@@ -23,6 +23,9 @@ Intercepts bash command output before the model sees it and applies semantic com
 | `find` (>30 results) | Full path listing | Dir/type summary + first 15 paths | ~70% |
 | `grep/rg` (>15 matches) | All matches | Grouped by file, match counts, lines truncated to 70 chars | ~65% |
 | `eslint/ruff/mypy/pylint` | Verbose per-file errors | Error/warning counts, top rules, top files | ~70% |
+| `cargo build/npm run build/make` | Compiling, Downloading, Linking noise | Errors + warnings + summary only | ~80% |
+| `vitest/jest/mocha/cargo test/go test` | Progress dots, setup noise | Pass/fail/skip counts + failure details | ~85% |
+| `npm install/pnpm install/pip install` | Resolution, download, deprecation warnings | Summary line + errors only | ~90% |
 | `tree` | Full tree with noise dirs | Stripped `.git/node_modules/.venv/__pycache__` | ~50-90% |
 | `env` | All variables, secrets in plain text | Secrets masked, values truncated | ~60% + security |
 | Python traceback | Full stack trace | First 2 + last 2 frames + exception | ~50% |
@@ -38,7 +41,13 @@ The killer feature that standalone proxies **cannot** do.
 
 Pi's `context` event fires before every LLM call with a deep copy of the conversation history. Condensed Milk retroactively compresses old tool results that the model already processed but are still consuming context:
 
-**Bash results** older than 8 turns → compressed via filter dispatch or line-count fallback.
+**Bash results** older than 8 turns → compressed via filter dispatch or line-count fallback (first 3 + last 3 lines preserved).
+
+**Command invalidation** — certain commands immediately stale preceding output without waiting for 8 turns:
+- `git add` / `git checkout` / `git reset` invalidates `git status`
+- `git commit` / `git merge` / `git rebase` invalidates `git diff` and `git log`
+- `npm install` / `pnpm add` invalidates `npm ls` / `npm outdated`
+- `pip install` invalidates `pip list` / `pip freeze`
 
 **Read (file) results** use smart staleness:
 - **Kept fresh** if the file was written/edited after being read (model is actively working on it)
@@ -59,6 +68,10 @@ Retroactive compression modifies conversation history, which can invalidate Anth
 ```
 
 When enabled, the context hook checks the timestamp of the last assistant message. If less than the TTL has passed, compression is skipped — the cache stays warm. Once the cache goes cold (idle for >5 min), compression runs freely.
+
+The TTL auto-adjusts based on pi's `PI_CACHE_RETENTION` environment variable:
+- **Default (unset):** 300s (5 min) — Anthropic's standard TTL
+- **`PI_CACHE_RETENTION=long`:** 3600s (1 hour) — automatically detected, no manual config needed
 
 Use `/compress-stats` to see whether cache-aware mode is helping your session:
 
@@ -147,6 +160,9 @@ condensed-milk/
 │   ├── dispatch.ts             # Command matching + compound splitting
 │   ├── ansi-strip.ts           # ANSI escape code removal (runs on ALL bash output)
 │   ├── pytest.ts               # pytest/python -m pytest
+│   ├── test-runners.ts         # vitest/jest/mocha/cargo test/go test
+│   ├── build.ts                # cargo build/npm run build/make/go build
+│   ├── install.ts              # npm/pnpm/yarn/pip install
 │   ├── git-status.ts           # git status (porcelain v1/v2/plain)
 │   ├── git-diff.ts             # git diff (strip headers, condense context)
 │   ├── git-mutations.ts        # git add/commit/push
@@ -160,7 +176,7 @@ condensed-milk/
 │   ├── log-dedup.ts            # journalctl, tail, docker logs, tmux
 │   ├── tsc.ts                  # TypeScript compiler
 │   ├── json-schema.ts          # JSON structure extraction (content-based)
-│   └── context-compress.ts     # Retroactive context compression
+│   └── context-compress.ts     # Retroactive context compression + command invalidation
 └── package.json
 ```
 

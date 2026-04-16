@@ -1,14 +1,37 @@
 {
-  "name": "condensed-milk",
+  "name": "@tomooshi/condensed-milk-pi",
   "version": "1.1.1",
-  "description": "Semantic token compression for pi terminal — compresses bash output and retroactively shrinks stale conversation history",
+  "description": "Semantic token compression for pi terminal — filters noisy bash output and retroactively masks stale tool results in conversation history (per JetBrains Dec 2025 + Anthropic tool-result clearing)",
   "author": "tomooshi",
   "license": "MIT",
+  "main": "index.ts",
   "repository": {
     "type": "git",
     "url": "https://github.com/tomooshi/condensed-milk-pi.git"
   },
-  "keywords": ["pi", "pi-terminal", "extension", "token-compression", "llm"],
+  "bugs": {
+    "url": "https://github.com/tomooshi/condensed-milk-pi/issues"
+  },
+  "homepage": "https://github.com/tomooshi/condensed-milk-pi#readme",
+  "keywords": [
+    "pi",
+    "pi-terminal",
+    "pi-extension",
+    "context-engineering",
+    "token-compression",
+    "observation-masking",
+    "prompt-compression",
+    "llm",
+    "claude",
+    "anthropic"
+  ],
+  "files": [
+    "index.ts",
+    "filters/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": ["./index.ts"]
   }

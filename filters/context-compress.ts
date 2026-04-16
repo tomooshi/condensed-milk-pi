@@ -1,38 +1,51 @@
 /**
- * Context-level retroactive compression.
+ * Context-level retroactive compression — observation masking.
  *
- * Compresses stale tool results (bash AND read) in conversation history
- * before each LLM call.
+ * Per JetBrains Research (Lindenbauer et al., Dec 2025) and Anthropic's
+ * Effective Context Engineering guide: observation masking outperforms
+ * LLM-style summarization for long-running agent sessions.
  *
- * Staleness for bash: >STALE_THRESHOLD turns old.
- * Staleness for read: smart — tracks file operations to determine if
- * a read is still relevant:
+ * Algorithm: fixed rolling window of last N messages kept in full. Older
+ * bash and read tool results replaced with deterministic placeholders of
+ * the form "[masked <tool>] <command-or-path>". Reference files
+ * (AGENTS.md, CONVENTIONS.md, etc.) are never masked. Bash commands
+ * invalidated by a later mutation (git add invalidates git status, etc.)
+ * are masked immediately regardless of window position.
  *
- *   KEEP if: file was written/edited AFTER being read (model is working on it)
- *   KEEP if: file is in the reference set (AGENTS.md, CONVENTIONS.md, configs)
- *   KEEP if: file appears in an edit/write tool_call within recent turns
- *   COMPRESS if: >STALE_THRESHOLD turns old AND no subsequent write
- *   COMPRESS if: file was re-read more recently (compress the OLDER duplicate)
+ * Why masking over summarization:
+ *   1. Byte-identical placeholders → single cache miss per tool-result
+ *      ever compressed, then stable forever (vs summarization where each
+ *      content change is a new miss).
+ *   2. JetBrains empirical: masking matches/beats summarization on
+ *      solve rate (-52% cost, +2.6% solve on Qwen3-Coder 480B).
+ *   3. Summaries cause trajectory elongation (+13-15% more turns) by
+ *      smoothing over stop-signals.
+ *   4. Agent can re-read files or re-run commands if needed
+ *      (just-in-time pattern per Anthropic).
+ *
+ * See knowledge/decisions/016-observation-masking... for full rationale.
  */
-import { dispatch } from "./dispatch.js";
 
-const STALE_THRESHOLD = 8;
-const MIN_COMPRESS_LENGTH = 200;
+/** Messages older than HEAD by this many entries get masked.
+ *  JetBrains found N=10 optimal for SWE-agent; tunable via config. */
+const DEFAULT_WINDOW = 10;
 
-/**
- * Command invalidation rules.
- * When a command in the 'invalidator' pattern runs, any preceding bash output
- * matching 'invalidated' pattern becomes immediately stale (no turn threshold).
- */
+/** Tool results shorter than this aren't worth masking — cost of the
+ *  mask bytes approaches the content bytes. */
+const MIN_MASK_LENGTH = 120;
+
+/** Command-invalidation rules: when the `invalidator` command runs, any
+ *  earlier output matching `invalidated` becomes stale immediately
+ *  (ignore rolling window for these). */
 const INVALIDATION_RULES: readonly { invalidator: RegExp; invalidated: RegExp }[] = [
   { invalidator: /^git\s+(add|rm|checkout|reset|stash|merge|rebase|cherry-pick)\b/, invalidated: /^git\s+status\b/ },
   { invalidator: /^git\s+(commit|merge|rebase)\b/, invalidated: /^git\s+(diff|log)\b/ },
   { invalidator: /^(npm|pnpm|yarn|bun)\s+(install|add|remove)\b/, invalidated: /^(npm|pnpm|yarn|bun)\s+(ls|list|outdated)\b/ },
   { invalidator: /^pip\s+install\b/, invalidated: /^pip\s+(list|freeze)\b/ },
 ];
-const MAX_SUMMARY_LENGTH = 150;
 
-/** Files that should never be compressed — reference docs, configs */
+/** Files that should never be masked — reference docs, project configs
+ *  the model relies on across turns. */
 const REFERENCE_FILES = new Set([
   "AGENTS.md", "CONVENTIONS.md", "CLAUDE.md",
   ".ruff.toml", "ruff.toml", "biome.json",
@@ -45,182 +58,120 @@ function isReferenceFile(path: string): boolean {
   return REFERENCE_FILES.has(basename);
 }
 
-/**
- * Build a map of file operations from the message history.
- * Returns: { path → { lastReadTurn, lastWriteTurn, readTurns[] } }
- */
-interface FileOps {
-  lastReadTurn: number;
-  lastWriteTurn: number;
-  readTurns: number[]; // All turns where this file was read
-}
-
-function buildFileOpsMap(messages: any[]): Map<string, FileOps> {
-  const ops = new Map<string, FileOps>();
-  let turnIdx = 0;
-
-  for (const m of messages) {
-    // Count turns by user messages
-    const msg = m?.message ?? m;
-    if (msg?.role === "user") {
-      turnIdx++;
-      continue;
-    }
-
-    // Track tool calls for write/edit
-    if (msg?.role === "assistant" && Array.isArray(msg?.content)) {
-      for (const block of msg.content) {
-        if (block?.type === "toolCall") {
-          const name = block.name;
-          if (name === "write" || name === "edit") {
-            const path = block.arguments?.path ?? block.arguments?.file_path ?? "";
-            if (path) {
-              const entry = ops.get(path) ?? { lastReadTurn: -1, lastWriteTurn: -1, readTurns: [] };
-              entry.lastWriteTurn = turnIdx;
-              ops.set(path, entry);
-            }
-          }
-        }
-      }
-    }
-
-    // Track read tool results
-    if (msg?.role === "toolResult" && msg?.toolName === "read") {
-      const path = (msg as any)?.details?.path ?? "";
-      if (path) {
-        const entry = ops.get(path) ?? { lastReadTurn: -1, lastWriteTurn: -1, readTurns: [] };
-        entry.lastReadTurn = turnIdx;
-        entry.readTurns.push(turnIdx);
-        ops.set(path, entry);
-      }
-    }
-  }
-
-  return ops;
-}
-
-/**
- * Determine if a read result should be compressed.
- */
-function shouldCompressRead(
-  path: string,
-  readTurn: number,
-  currentTurn: number,
-  fileOps: Map<string, FileOps>,
-): boolean {
-  // Never compress reference files
-  if (isReferenceFile(path)) return false;
-
-  const ops = fileOps.get(path);
-  if (!ops) return false;
-
-  // Not old enough
-  if (currentTurn - readTurn < STALE_THRESHOLD) return false;
-
-  // File was written/edited AFTER this read — model is working on it, keep
-  if (ops.lastWriteTurn > readTurn) return false;
-
-  // This is NOT the most recent read of this file — compress (newer read supersedes)
-  if (ops.lastReadTurn > readTurn) return true;
-
-  // Old read, never subsequently written — compress
-  return true;
+export interface CompressResult {
+  messages: any[];
+  bytesSaved: number;
+  masksApplied: number;
 }
 
 /**
  * Process messages array from context event.
- * Returns modified array if any compressions were made, null otherwise.
+ * Returns new array with masks applied + byte-savings count.
+ * Returns null if nothing changed.
  */
-export function compressStaleToolResults(messages: any[]): any[] | null {
-  if (messages.length === 0) return null;
+export function compressStaleToolResults(
+  messages: any[],
+  windowSize: number = DEFAULT_WINDOW,
+): CompressResult | null {
+  if (messages.length <= windowSize) return null;
 
-  // Count total turns
-  let totalTurns = 0;
-  for (const m of messages) {
-    const msg = m?.message ?? m;
-    if (msg?.role === "user") totalTurns++;
-  }
+  // Everything at idx < staleBeforeIdx is outside the window → candidate for mask.
+  const staleBeforeIdx = messages.length - windowSize;
 
-  // Not enough history for compression
-  if (totalTurns < STALE_THRESHOLD) return null;
+  // Build toolCallId → { command, path } lookup from preceding assistant
+  // toolCalls. Needed because persisted toolResults lack `details`/`input`
+  // fields — the command/path only lives on the assistant toolCall block.
+  // In live `context` events `details` is populated, but the lookup is
+  // cheap and makes the transform robust to both shapes.
+  const toolCallIndex = buildToolCallIndex(messages);
 
-  // Build file operations map for smart read compression
-  const fileOps = buildFileOpsMap(messages);
-
-  // Find stale-before index for bash (same as before)
-  let turnCount = 0;
-  let staleBeforeIdx = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]?.message ?? messages[i];
-    if (msg?.role === "user") {
-      turnCount++;
-      if (turnCount >= STALE_THRESHOLD) {
-        staleBeforeIdx = i;
-        break;
-      }
-    }
-  }
-
-  let modified = false;
-  let currentTurn = 0;
+  let bytesSaved = 0;
+  let masksApplied = 0;
 
   const result = messages.map((m: any, idx: number) => {
     const msg = m?.message ?? m;
-    if (msg?.role === "user") currentTurn++;
 
-    // === BASH COMPRESSION (turn-based + command invalidation) ===
+    // Already masked — pass through untouched (idempotent, cache-stable).
+    if (isAlreadyMasked(msg)) return m;
+
+    // BASH: mask if past window OR invalidated by later command.
     if (isBashToolResult(msg) && !msg.isError) {
       const content = extractTextContent(msg);
-      if (content.length >= MIN_COMPRESS_LENGTH && !content.startsWith("[compressed]")) {
-        const command = msg.details?.command ?? (msg as any)?.input?.command ?? "";
+      if (content.length < MIN_MASK_LENGTH) return m;
 
-        // Check if this command's output was invalidated by a later command
-        const isInvalidated = idx < staleBeforeIdx || isCommandInvalidated(command, currentTurn, messages, idx);
+      const command = extractCommand(msg, toolCallIndex);
+      const pastWindow = idx < staleBeforeIdx;
+      const invalidated = !pastWindow && isCommandInvalidated(command, messages, idx, toolCallIndex);
 
-        if (isInvalidated) {
-          const summary = compressBashContent(command, content);
-          modified = true;
-          return replaceContent(m, `[compressed] ${summary}`);
-        }
+      if (pastWindow || invalidated) {
+        const placeholder = command
+          ? `[masked bash] ${command.slice(0, 80)}`
+          : `[masked bash]`;
+        bytesSaved += content.length - placeholder.length;
+        masksApplied++;
+        return replaceContent(m, placeholder);
       }
     }
 
-    // === READ COMPRESSION (smart, file-ops-aware) ===
+    // READ: mask if past window AND not a reference file.
     if (isReadToolResult(msg) && !msg.isError) {
-      const path = msg.details?.path ?? "";
+      const path = extractPath(msg, toolCallIndex);
       const content = extractTextContent(msg);
 
-      if (path && content.length >= MIN_COMPRESS_LENGTH && !content.startsWith("[compressed]")) {
-        if (shouldCompressRead(path, currentTurn, totalTurns, fileOps)) {
-          const lineCount = content.split("\n").length;
-          // Keep first 3 lines (imports/header) for context
-          const preview = content.split("\n").slice(0, 3).join("\n");
-          const summary = `read ${path} (${lineCount} lines)\n${preview}\n...`;
-          modified = true;
-          return replaceContent(m, `[compressed] ${summary}`);
-        }
+      if (path && content.length >= MIN_MASK_LENGTH && !isReferenceFile(path) && idx < staleBeforeIdx) {
+        const placeholder = `[masked read] ${path}`;
+        bytesSaved += content.length - placeholder.length;
+        masksApplied++;
+        return replaceContent(m, placeholder);
       }
     }
 
     return m;
   });
 
-  return modified ? result : null;
+  if (masksApplied === 0) return null;
+
+  return { messages: result, bytesSaved, masksApplied };
 }
 
-/**
- * Check if a bash command's output has been invalidated by a subsequent command.
- * Scans forward from the command's position for invalidating commands.
- */
-function isCommandInvalidated(command: string, _currentTurn: number, messages: any[], fromIdx: number): boolean {
-  const applicableRules = INVALIDATION_RULES.filter((r) => r.invalidated.test(command));
-  if (applicableRules.length === 0) return false;
+/** Scan messages, return Map<toolCallId, {command, path}> built from
+ *  assistant toolCall blocks. Supports both `id` and `toolCallId` keys
+ *  (live vs persisted variants). */
+function buildToolCallIndex(messages: any[]): Map<string, { command?: string; path?: string }> {
+  const idx = new Map<string, { command?: string; path?: string }>();
+  for (const m of messages) {
+    const msg = m?.message ?? m;
+    if (msg?.role !== "assistant") continue;
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type !== "toolCall") continue;
+      const id = block.id ?? block.toolCallId;
+      if (!id) continue;
+      const args = block.arguments ?? block.input ?? {};
+      idx.set(id, {
+        command: typeof args.command === "string" ? args.command : undefined,
+        path: typeof args.path === "string" ? args.path : undefined,
+      });
+    }
+  }
+  return idx;
+}
+
+function isCommandInvalidated(
+  command: string,
+  messages: any[],
+  fromIdx: number,
+  toolCallIndex: Map<string, { command?: string; path?: string }>,
+): boolean {
+  const applicable = INVALIDATION_RULES.filter((r) => r.invalidated.test(command));
+  if (applicable.length === 0) return false;
 
   for (let i = fromIdx + 1; i < messages.length; i++) {
-    const m = messages[i]?.message ?? messages[i];
-    if (!isBashToolResult(m)) continue;
-    const laterCmd = m.details?.command ?? (m as any)?.input?.command ?? "";
-    if (applicableRules.some((r) => r.invalidator.test(laterCmd))) return true;
+    const later = messages[i]?.message ?? messages[i];
+    if (!isBashToolResult(later)) continue;
+    const laterCmd = extractCommand(later, toolCallIndex);
+    if (applicable.some((r) => r.invalidator.test(laterCmd))) return true;
   }
   return false;
 }
@@ -233,29 +184,39 @@ function isReadToolResult(msg: any): boolean {
   return msg?.role === "toolResult" && msg?.toolName === "read";
 }
 
+function isAlreadyMasked(msg: any): boolean {
+  if (msg?.role !== "toolResult") return false;
+  const content = (msg.content ?? [])[0];
+  if (!content || content.type !== "text") return false;
+  const text = content.text ?? "";
+  return text.startsWith("[masked ") || text.startsWith("[compressed]");
+}
+
+function extractCommand(msg: any, toolCallIndex?: Map<string, { command?: string; path?: string }>): string {
+  // Live path: details populated
+  const fromDetails = msg?.details?.command ?? msg?.input?.command;
+  if (fromDetails) return fromDetails;
+  // Persisted path: look up via toolCallId
+  if (toolCallIndex && msg?.toolCallId) {
+    return toolCallIndex.get(msg.toolCallId)?.command ?? "";
+  }
+  return "";
+}
+
+function extractPath(msg: any, toolCallIndex?: Map<string, { command?: string; path?: string }>): string {
+  const fromDetails = msg?.details?.path ?? msg?.input?.path;
+  if (fromDetails) return fromDetails;
+  if (toolCallIndex && msg?.toolCallId) {
+    return toolCallIndex.get(msg.toolCallId)?.path ?? "";
+  }
+  return "";
+}
+
 function extractTextContent(msg: any): string {
   return (msg.content ?? [])
     .filter((c: any) => c?.type === "text")
     .map((c: any) => c.text ?? "")
     .join("\n");
-}
-
-function compressBashContent(command: string, content: string): string {
-  const compressed = dispatch(command, content);
-  if (compressed) return compressed.output;
-
-  // Fallback: line count + first 3 + last 3 lines preview
-  const lines = content.split("\n").filter((l: string) => l.length > 0);
-  if (lines.length <= 6) {
-    let summary = `${lines.length} lines: ${lines[0]?.slice(0, 80) ?? ""}`;
-    if (summary.length > MAX_SUMMARY_LENGTH) summary = summary.slice(0, MAX_SUMMARY_LENGTH) + "...";
-    return summary;
-  }
-  const head = lines.slice(0, 3).map((l: string) => l.slice(0, 80)).join("\n");
-  const tail = lines.slice(-3).map((l: string) => l.slice(0, 80)).join("\n");
-  let summary = `${lines.length} lines:\n${head}\n... +${lines.length - 6} more ...\n${tail}`;
-  if (summary.length > MAX_SUMMARY_LENGTH) summary = summary.slice(0, MAX_SUMMARY_LENGTH) + "...";
-  return summary;
 }
 
 function replaceContent(m: any, text: string): any {

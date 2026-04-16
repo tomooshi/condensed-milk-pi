@@ -36,14 +36,15 @@ import { compressStaleToolResults } from "./filters/context-compress.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 
 // --- Config ---
+// v1.1.0: cacheAware gate removed (was broken AND unnecessary under
+// masking — deterministic placeholders self-stabilize cache). Only
+// tunable is rolling window size.
 interface CompressorConfig {
-  cacheAware: boolean;   // Wait for cache TTL before retroactive compression
-  cacheTtlMs: number;    // Cache TTL in milliseconds (default: 300000 = 5min, Anthropic's TTL)
+  windowSize: number;  // Messages-from-HEAD kept unmasked. JetBrains default: 10.
 }
 
 const DEFAULT_CONFIG: CompressorConfig = {
-  cacheAware: false,
-  cacheTtlMs: 300_000,
+  windowSize: 10,
 };
 
 const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
@@ -53,8 +54,9 @@ function loadConfig(): CompressorConfig {
     const raw = readFileSync(CONFIG_PATH, "utf-8");
     const parsed = JSON.parse(raw);
     return {
-      cacheAware: typeof parsed.cacheAware === "boolean" ? parsed.cacheAware : DEFAULT_CONFIG.cacheAware,
-      cacheTtlMs: typeof parsed.cacheTtlMs === "number" ? parsed.cacheTtlMs : DEFAULT_CONFIG.cacheTtlMs,
+      windowSize: typeof parsed.windowSize === "number" && parsed.windowSize > 0
+        ? parsed.windowSize
+        : DEFAULT_CONFIG.windowSize,
     };
   } catch {
     return { ...DEFAULT_CONFIG };
@@ -70,7 +72,7 @@ function saveConfig(cfg: CompressorConfig): void {
   }
 }
 
-// --- Cache tradeoff instrumentation ---
+// --- Per-turn telemetry ---
 interface TurnCacheData {
   turn: number;
   cacheRead: number;
@@ -78,7 +80,7 @@ interface TurnCacheData {
   input: number;
   output: number;
   bytesCompressed: number;
-  cacheSkipped: boolean;
+  masksApplied: number;
 }
 
 export default function tokenCompressor(pi: ExtensionAPI) {
@@ -91,11 +93,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let compressedCount = 0;
   let totalCommands = 0;
 
-  // Config — load persisted settings, auto-detect cache TTL from pi
+  // Config
   let config: CompressorConfig = loadConfig();
-  if (process.env.PI_CACHE_RETENTION === "long" && config.cacheTtlMs === DEFAULT_CONFIG.cacheTtlMs) {
-    config.cacheTtlMs = 3_600_000; // 1 hour to match pi's extended cache
-  }
 
   // Cache tracking
   let cacheHistory: TurnCacheData[] = [];
@@ -104,7 +103,6 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let totalInput = 0;
   let totalOutput = 0;
   let turnCounter = 0;
-  let cacheSkipCount = 0;
 
   pi.on("session_start", async (_event, ctx) => {
     totalOriginal = 0;
@@ -117,7 +115,6 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     totalInput = 0;
     totalOutput = 0;
     turnCounter = 0;
-    cacheSkipCount = 0;
     const cmds = registeredCommands();
     ctx.ui?.setStatus?.("token-savings", `↓0 (${cmds.length}f)`);
   });
@@ -177,16 +174,14 @@ export default function tokenCompressor(pi: ExtensionAPI) {
 
   pi.on("context", async (event, _ctx) => {
     turnCounter++;
-    let turnBytesCompressed = 0;
-    let skippedForCache = false;
 
-    // Recalculate cumulative cache stats from all assistant messages
+    // Recalculate cumulative cache stats from all assistant messages.
+    // Analytical sum — no full-history JSON.stringify (v1.1.0 perf fix).
     totalCacheRead = 0;
     totalCacheWrite = 0;
     totalInput = 0;
     totalOutput = 0;
     let lastUsage: { input: number; output: number; cacheRead: number; cacheWrite: number } | null = null;
-    let lastAssistantTimestamp = 0;
 
     for (const m of event.messages) {
       const msg = (m as any)?.message ?? m;
@@ -202,38 +197,18 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           cacheRead: u.cacheRead ?? 0,
           cacheWrite: u.cacheWrite ?? 0,
         };
-        // Track timestamp — use createdAt if available, otherwise estimate from position
-        if (msg.createdAt) {
-          lastAssistantTimestamp = typeof msg.createdAt === "number" ? msg.createdAt : new Date(msg.createdAt).getTime();
-        }
       }
     }
 
-    // Cache-aware gate: skip compression if cache is likely still warm
-    let shouldCompress = true;
-    if (config.cacheAware && lastAssistantTimestamp > 0) {
-      const elapsed = Date.now() - lastAssistantTimestamp;
-      if (elapsed < config.cacheTtlMs) {
-        shouldCompress = false;
-        skippedForCache = true;
-        cacheSkipCount++;
-      }
-    }
+    // Apply masking. Returns null if nothing to mask, else { messages,
+    // bytesSaved, masksApplied } — analytical stats, no JSON.stringify.
+    const result = compressStaleToolResults(event.messages, config.windowSize);
+    const turnBytesCompressed = result?.bytesSaved ?? 0;
+    const turnMasksApplied = result?.masksApplied ?? 0;
 
-    // Compression
-    let compressed: any[] | null = null;
-    if (shouldCompress) {
-      compressed = compressStaleToolResults(event.messages);
-      if (compressed) {
-        const originalLen = JSON.stringify(event.messages).length;
-        const compressedLen = JSON.stringify(compressed).length;
-        const saved = originalLen - compressedLen;
-        if (saved > 0) {
-          contextSaved += saved;
-          contextCompressions++;
-          turnBytesCompressed = saved;
-        }
-      }
+    if (result) {
+      contextSaved += result.bytesSaved;
+      contextCompressions++;
     }
 
     // Record this turn
@@ -245,12 +220,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         input: lastUsage.input,
         output: lastUsage.output,
         bytesCompressed: turnBytesCompressed,
-        cacheSkipped: skippedForCache,
+        masksApplied: turnMasksApplied,
       });
     }
 
-    if (compressed) {
-      return { messages: compressed };
+    if (result) {
+      return { messages: result.messages };
     }
   });
 
@@ -310,8 +285,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         "Tradeoff",
         `  Context freed: ${formatBytes(contextSaved)} (~${formatTokens(tokensSaved)})`,
         `  Turns tracked: ${cacheHistory.length}`,
-        `  Cache-aware: ${config.cacheAware ? `ON (TTL: ${config.cacheTtlMs / 1000}s)` : "OFF"}`,
-        `  Compressions skipped (cache warm): ${cacheSkipCount}`,
+        `  Rolling window: ${config.windowSize} messages`,
       ];
 
       // Show last 5 turns cache data
@@ -327,9 +301,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           const writeRate = (t.input + t.cacheRead + t.cacheWrite) > 0
             ? ((t.cacheWrite / (t.input + t.cacheRead + t.cacheWrite)) * 100).toFixed(0)
             : "0";
-          const skipTag = t.cacheSkipped ? " [cache-wait]" : "";
+          const maskTag = t.masksApplied > 0 ? ` [+${t.masksApplied} mask${t.masksApplied > 1 ? "s" : ""}]` : "";
           lines.push(
-            `  T${t.turn}: hit ${hitRate}% | write ${writeRate}% | read ${formatTokens(t.cacheRead)} | new ${formatTokens(t.cacheWrite)} | uncached ${formatTokens(t.input)} | compressed ${formatBytes(t.bytesCompressed)}${skipTag}`,
+            `  T${t.turn}: hit ${hitRate}% | write ${writeRate}% | read ${formatTokens(t.cacheRead)} | new ${formatTokens(t.cacheWrite)} | uncached ${formatTokens(t.input)} | masked ${formatBytes(t.bytesCompressed)}${maskTag}`,
           );
         }
       }
@@ -340,57 +314,43 @@ export default function tokenCompressor(pi: ExtensionAPI) {
 
   // /compress-config command
   pi.registerCommand("compress-config", {
-    description: "Configure token compressor (cache-aware on/off, cache-ttl <seconds>)",
+    description: "Configure token compressor (window-size <N>)",
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().split(/\s+/);
       const key = parts[0]?.toLowerCase();
-      const value = parts[1]?.toLowerCase();
+      const value = parts[1];
 
       if (!key) {
         ctx.ui?.notify?.(
           [
             "Compressor Config",
-            `  cache-aware: ${config.cacheAware ? "on" : "off"}`,
-            `  cache-ttl:   ${config.cacheTtlMs / 1000}s`,
+            `  window-size: ${config.windowSize}`,
             "",
             "Usage:",
-            "  /compress-config cache-aware on    # wait for cache TTL before compressing",
-            "  /compress-config cache-aware off   # compress immediately (default)",
-            "  /compress-config cache-ttl 300     # set TTL in seconds (default: 300)",
+            "  /compress-config window-size 10   # messages-from-HEAD kept unmasked (default: 10)",
+            "",
+            "Masking (v1.1.0): deterministic [masked <tool>] placeholders.",
+            "Older tool results outside the window get replaced with a",
+            "byte-stable placeholder. Cache-safe by design.",
           ].join("\n"),
           "info",
         );
         return;
       }
 
-      if (key === "cache-aware") {
-        if (value === "on" || value === "true" || value === "1") {
-          config.cacheAware = true;
-          saveConfig(config);
-          ctx.ui?.notify?.(`Cache-aware compression: ON (TTL: ${config.cacheTtlMs / 1000}s)`, "info");
-        } else if (value === "off" || value === "false" || value === "0") {
-          config.cacheAware = false;
-          saveConfig(config);
-          ctx.ui?.notify?.("Cache-aware compression: OFF", "info");
-        } else {
-          ctx.ui?.notify?.("Usage: /compress-config cache-aware on|off", "warning");
-        }
-        return;
-      }
-
-      if (key === "cache-ttl") {
-        const seconds = Number.parseInt(value ?? "", 10);
-        if (Number.isNaN(seconds) || seconds < 0) {
-          ctx.ui?.notify?.("Usage: /compress-config cache-ttl <seconds>", "warning");
+      if (key === "window-size") {
+        const n = Number.parseInt(value ?? "", 10);
+        if (Number.isNaN(n) || n < 1) {
+          ctx.ui?.notify?.("Usage: /compress-config window-size <positive integer>", "warning");
           return;
         }
-        config.cacheTtlMs = seconds * 1000;
+        config.windowSize = n;
         saveConfig(config);
-        ctx.ui?.notify?.(`Cache TTL set to ${seconds}s`, "info");
+        ctx.ui?.notify?.(`Rolling window set to ${n} messages`, "info");
         return;
       }
 
-      ctx.ui?.notify?.(`Unknown config key: ${key}. Use cache-aware or cache-ttl.`, "warning");
+      ctx.ui?.notify?.(`Unknown config key: ${key}. Use window-size.`, "warning");
     },
   });
 }

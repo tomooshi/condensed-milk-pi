@@ -109,6 +109,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     totalCompressed = 0;
     compressedCount = 0;
     totalCommands = 0;
+    contextSaved = 0;
+    contextMaskEvents = 0;
+    contextMasksTotal = 0;
     cacheHistory = [];
     totalCacheRead = 0;
     totalCacheWrite = 0;
@@ -169,8 +172,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
 
   // Context-level retroactive compression
   // Compresses old bash tool results before each LLM call
-  let contextSaved = 0;
-  let contextCompressions = 0;
+  let contextSaved = 0;          // cumulative bytes freed by masking across session
+  let contextMaskEvents = 0;      // distinct context events that applied ≥1 mask
+  let contextMasksTotal = 0;      // cumulative individual tool results masked
 
   pi.on("context", async (event, _ctx) => {
     turnCounter++;
@@ -208,7 +212,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
 
     if (result) {
       contextSaved += result.bytesSaved;
-      contextCompressions++;
+      contextMaskEvents++;
+      contextMasksTotal += result.masksApplied;
     }
 
     // Record this turn
@@ -260,9 +265,6 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       const costNoCache = costNoCacheInput + costOutput;
       const cacheSavings = costNoCache - totalCost;
 
-      // Context runway estimate (~4 chars per token)
-      const tokensSaved = Math.round(contextSaved / 4);
-
       const lines = [
         "Token Compressor Stats",
         `  Filters: ${cmds.join(", ")}`,
@@ -271,7 +273,10 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  Original: ${formatBytes(totalOriginal)}`,
         `  Compressed: ${formatBytes(totalCompressed)}`,
         `  Saved: ${formatBytes(totalSaved)} (${pct}%)`,
-        `  Context retroactive: ${formatBytes(contextSaved)} saved (${contextCompressions} compressions)`,
+        "",
+        "Retroactive Masking (v1.1.0)",
+        `  Tool results masked: ${contextMasksTotal} across ${contextMaskEvents} events`,
+        `  Bytes freed: ${formatBytes(contextSaved)} (~${formatTokens(Math.round(contextSaved / 4))})`,
         "",
         "Cache Impact",
         `  Total input: ${formatTokens(totalAllInput)}`,
@@ -283,9 +288,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  vs no cache:  $${costNoCache.toFixed(2)} (saving $${cacheSavings.toFixed(2)})`,
         "",
         "Tradeoff",
-        `  Context freed: ${formatBytes(contextSaved)} (~${formatTokens(tokensSaved)})`,
         `  Turns tracked: ${cacheHistory.length}`,
-        `  Rolling window: ${config.windowSize} messages`,
+        `  Rolling window: ${config.windowSize} messages (older tool results get masked)`,
       ];
 
       // Show last 5 turns cache data

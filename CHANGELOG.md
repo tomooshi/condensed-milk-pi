@@ -2,6 +2,19 @@
 
 All notable changes to condensed-milk.
 
+## [1.1.1] - 2026-04-16
+
+### Fixed
+
+- `/compress-stats` output now correctly reports retroactive masking:
+  total tool results masked, distinct mask events, bytes freed — instead
+  of the stale `Context retroactive: X saved (N compressions)` line
+  which conflated per-event counts with per-mask counts.
+- Context-retroactive counters (`contextSaved`, `contextMaskEvents`,
+  `contextMasksTotal`) now reset on `session_start` along with the
+  other per-session state.
+- Removed unused `tokensSaved` local variable.
+
 ## [1.1.0] - 2026-04-16
 
 ### Changed — retroactive compression switched from summarization to observation masking

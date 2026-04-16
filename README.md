@@ -147,7 +147,7 @@ Shows a running total: `↓12.5KB saved (15/42 cmds, 68%)`
 
 - **Cache hit rate** — percentage of input tokens served from Anthropic's prompt cache
 - **Cache writes** — tokens where new cache entries were created (potential invalidation indicator)
-- **Cost breakdown** — per-category costs at Opus 4.6 pricing
+- **Cost breakdown** — per-category costs at Opus 4.7 pricing
 - **Per-turn history** — last 5 turns showing hit/write rates and compression amounts
 - **`[cache-wait]` tags** — turns where compression was skipped due to cache-aware mode
 
@@ -188,7 +188,7 @@ condensed-milk/
 
 3. **Filter dispatch** — splits compound commands, strips pipes/redirects/env vars, and matches against registered filter prefixes. Longest prefix wins. Filters return `null` to decline (output passes through unchanged).
 
-4. **Cache instrumentation** — tracks per-turn cache hit rates, cache write rates, and compression amounts. Reports cumulative cost analysis at Opus 4.6 pricing via `/compress-stats`.
+4. **Cache instrumentation** — tracks per-turn cache hit rates, cache write rates, and compression amounts. Reports cumulative cost analysis at Opus 4.7 pricing via `/compress-stats`.
 
 ### Adding Filters
 

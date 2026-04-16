@@ -268,11 +268,11 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       const cacheWriteRate = totalAllInput > 0 ? (totalCacheWrite / totalAllInput) * 100 : 0;
       const uncachedRate = totalAllInput > 0 ? (totalInput / totalAllInput) * 100 : 0;
 
-      // Cost calculation (Opus 4.6 pricing)
-      const PRICE_INPUT = 15;        // $/MTok uncached
-      const PRICE_CACHE_READ = 1.5;  // $/MTok cached
-      const PRICE_CACHE_WRITE = 18.75; // $/MTok cache write
-      const PRICE_OUTPUT = 75;       // $/MTok output
+      // Cost calculation (Opus 4.7 pricing)
+      const PRICE_INPUT = 5;         // $/MTok uncached
+      const PRICE_CACHE_READ = 0.5;  // $/MTok cached
+      const PRICE_CACHE_WRITE = 6.25; // $/MTok cache write
+      const PRICE_OUTPUT = 25;       // $/MTok output
 
       const costInput = (totalInput / 1_000_000) * PRICE_INPUT;
       const costCacheRead = (totalCacheRead / 1_000_000) * PRICE_CACHE_READ;
@@ -300,10 +300,10 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         "",
         "Cache Impact",
         `  Total input: ${formatTokens(totalAllInput)}`,
-        `  Cache hits:   ${formatTokens(totalCacheRead)} (${cacheHitRate.toFixed(1)}%) @ $1.50/M = $${costCacheRead.toFixed(2)}`,
-        `  Cache writes: ${formatTokens(totalCacheWrite)} (${cacheWriteRate.toFixed(1)}%) @ $18.75/M = $${costCacheWrite.toFixed(2)}`,
-        `  Uncached:     ${formatTokens(totalInput)} (${uncachedRate.toFixed(1)}%) @ $15/M = $${costInput.toFixed(2)}`,
-        `  Output:       ${formatTokens(totalOutput)} @ $75/M = $${costOutput.toFixed(2)}`,
+        `  Cache hits:   ${formatTokens(totalCacheRead)} (${cacheHitRate.toFixed(1)}%) @ $${PRICE_CACHE_READ}/M = $${costCacheRead.toFixed(2)}`,
+        `  Cache writes: ${formatTokens(totalCacheWrite)} (${cacheWriteRate.toFixed(1)}%) @ $${PRICE_CACHE_WRITE}/M = $${costCacheWrite.toFixed(2)}`,
+        `  Uncached:     ${formatTokens(totalInput)} (${uncachedRate.toFixed(1)}%) @ $${PRICE_INPUT}/M = $${costInput.toFixed(2)}`,
+        `  Output:       ${formatTokens(totalOutput)} @ $${PRICE_OUTPUT}/M = $${costOutput.toFixed(2)}`,
         `  Session cost: $${totalCost.toFixed(2)}`,
         `  vs no cache:  $${costNoCache.toFixed(2)} (saving $${cacheSavings.toFixed(2)})`,
         "",

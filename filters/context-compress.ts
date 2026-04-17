@@ -63,6 +63,12 @@ export interface CompressResult {
   /** The cutoff index used for this pass. Consumer persists this across
    *  calls so T doesn't regress. */
   cutoffIdx: number;
+  /** Paths of read tool results newly masked this call. Caller records
+   *  these + the current turn to detect re-reads. (v1.3.0 exp 3.) */
+  maskedPaths: string[];
+  /** Commands of bash tool results newly masked this call. Full command,
+   *  not the 80-char truncated placeholder. */
+  maskedCommands: string[];
 }
 
 export interface CompressOptions {
@@ -146,6 +152,8 @@ export function compressStaleToolResults(
 
   let bytesSaved = 0;
   let masksApplied = 0;
+  const maskedPaths: string[] = [];
+  const maskedCommands: string[] = [];
 
   const result = messages.map((m: any, idx: number) => {
     const msg = m?.message ?? m;
@@ -166,6 +174,7 @@ export function compressStaleToolResults(
           : `[masked bash]`;
         bytesSaved += content.length - placeholder.length;
         masksApplied++;
+        if (command) maskedCommands.push(command);
         return replaceContent(m, placeholder);
       }
     }
@@ -179,6 +188,7 @@ export function compressStaleToolResults(
         const placeholder = `[masked read] ${path}`;
         bytesSaved += content.length - placeholder.length;
         masksApplied++;
+        maskedPaths.push(path);
         return replaceContent(m, placeholder);
       }
     }
@@ -188,7 +198,7 @@ export function compressStaleToolResults(
 
   if (masksApplied === 0) return null;
 
-  return { messages: result, bytesSaved, masksApplied, cutoffIdx };
+  return { messages: result, bytesSaved, masksApplied, cutoffIdx, maskedPaths, maskedCommands };
 }
 
 /** Scan messages, return Map<toolCallId, {command, path}> from assistant

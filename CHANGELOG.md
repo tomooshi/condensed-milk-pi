@@ -2,6 +2,39 @@
 
 All notable changes to condensed-milk.
 
+## [1.3.0] - 2026-04-17
+
+### Added — re-read telemetry (instrumentation only, no behavior change)
+
+Tracks whether the model re-reads a file or re-runs a command AFTER
+it was masked. A re-read signals the placeholder wasn't sufficient —
+masking was semantically lossy for that item.
+
+**Mechanism:**
+- When a read/bash tool result is newly masked, the extension records
+  `(path | command, turnNumber)` in an in-memory Map.
+- On a subsequent `tool_result`, if the same path or command appears,
+  increment `reReadCount`, record `turnsSinceMask` delta, evict the
+  entry (consumed).
+
+**Surfaced in `/compress-stats`:**
+```
+Re-read Telemetry (v1.3.0 exp 3)
+  Tracked masks: N reads, M bashes
+  Re-read events: K (R reads, B bashes)
+  Re-read rate: X.X% of masks refetched
+  Avg turns since mask: Y.Y
+```
+
+**Defaults unchanged** (ADR-020 defers the default-threshold change
+from the v1.3.0 exp 1 sweep until this telemetry produces a signal).
+
+**API change:** `CompressResult` now includes `maskedPaths: string[]`
+and `maskedCommands: string[]` listing newly-masked items this call.
+Callers that only read `.masksApplied` are unaffected.
+
+ADR-021 (`knowledge/decisions/021-re-read-telemetry-for-condensed-milk-masking.md`).
+
 ## [1.2.1] - 2026-04-16
 
 ### Fixed — drift bug in v1.2.0 static-cutoff algorithm

@@ -125,6 +125,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     contextMasksTotal = 0;
     persistentCutoff = 0;
     zoneEntered = -1;
+    maskedReadPaths.clear();
+    maskedBashCommands.clear();
+    reReadCount = 0;
+    reReadByRead = 0;
+    reReadByBash = 0;
+    reReadTurnsDeltaSum = 0;
     cacheHistory = [];
     totalCacheRead = 0;
     totalCacheWrite = 0;
@@ -136,11 +142,34 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, _ctx) => {
+    // v1.3.0 exp 3: re-read detection for read tool.
+    // If a path was previously masked and the model just re-read it,
+    // the mask was semantically lossy — record it.
+    if (event.toolName === "read") {
+      const path = (event.input as { path?: string })?.path;
+      if (path && maskedReadPaths.has(path)) {
+        const maskedTurn = maskedReadPaths.get(path)!;
+        reReadCount++;
+        reReadByRead++;
+        reReadTurnsDeltaSum += Math.max(0, turnCounter - maskedTurn);
+        maskedReadPaths.delete(path);  // consumed — the re-read replaces the stale mask
+      }
+      return;  // read output untouched by compressor filters
+    }
     if (event.toolName !== "bash") return;
     // Don't skip errors — traceback filter specifically targets error output
 
     const command = (event.input as { command?: string })?.command;
     if (!command) return;
+
+    // v1.3.0 exp 3: re-read detection for bash.
+    if (maskedBashCommands.has(command)) {
+      const maskedTurn = maskedBashCommands.get(command)!;
+      reReadCount++;
+      reReadByBash++;
+      reReadTurnsDeltaSum += Math.max(0, turnCounter - maskedTurn);
+      maskedBashCommands.delete(command);
+    }
 
     // Extract text content from tool result (preserve non-text blocks like images)
     const textParts = event.content
@@ -190,6 +219,18 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let contextMasksTotal = 0;      // cumulative individual tool results masked
   let persistentCutoff = 0;       // ADR-018: T never regresses across turns
   let zoneEntered = -1;           // v1.2.1: highest pressure zone ever entered; cutoff frozen on zone transition
+
+  // v1.3.0 exp 3: re-read telemetry.
+  // Map<path, turnMasked> for reads; Map<command, turnMasked> for bashes.
+  // On tool_result, if the same path/command appears, this is a re-read:
+  // the model discarded the placeholder and refetched. Records turn
+  // delta (turns between mask and re-read) to measure mask longevity.
+  const maskedReadPaths = new Map<string, number>();
+  const maskedBashCommands = new Map<string, number>();
+  let reReadCount = 0;
+  let reReadByRead = 0;
+  let reReadByBash = 0;
+  let reReadTurnsDeltaSum = 0;  // sum of (currentTurn - turnMasked); mean = sum / reReadCount
 
   pi.on("context", async (event, ctx) => {
     turnCounter++;
@@ -257,6 +298,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       contextSaved += result.bytesSaved;
       contextMaskEvents++;
       contextMasksTotal += result.masksApplied;
+      // v1.3.0 exp 3: record newly-masked items so we can detect later re-reads.
+      for (const p of result.maskedPaths) maskedReadPaths.set(p, turnCounter);
+      for (const c of result.maskedCommands) maskedBashCommands.set(c, turnCounter);
       // persistentCutoff already updated on zone transition; nothing to do here
     }
 
@@ -322,6 +366,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  Tool results masked: ${contextMasksTotal} across ${contextMaskEvents} events`,
         `  Bytes freed: ${formatBytes(contextSaved)} (~${formatTokens(Math.round(contextSaved / 4))})`,
         `  Current cutoff: msg #${persistentCutoff}`,
+        "",
+        "Re-read Telemetry (v1.3.0 exp 3)",
+        `  Tracked masks: ${maskedReadPaths.size} reads, ${maskedBashCommands.size} bashes`,
+        `  Re-read events: ${reReadCount} (${reReadByRead} reads, ${reReadByBash} bashes)`,
+        `  Re-read rate: ${contextMasksTotal > 0 ? ((reReadCount / contextMasksTotal) * 100).toFixed(1) : "0.0"}% of masks refetched`,
+        `  Avg turns since mask: ${reReadCount > 0 ? (reReadTurnsDeltaSum / reReadCount).toFixed(1) : "—"}`,
         "",
         "Cache Impact",
         `  Total input: ${formatTokens(totalAllInput)}`,

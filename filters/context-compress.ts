@@ -1,6 +1,7 @@
 /**
  * Context-level retroactive compression — static-cutoff observation masking.
  *
+ * v1.6.0 (ADR-024): cwd-aware invalidation + user-configurable rules.
  * v1.2.0 (ADR-018): static cutoff replaces rolling window.
  *
  * The mask cutoff T advances only when context usage crosses a pressure
@@ -33,19 +34,22 @@ const DEFAULT_COVERAGE: readonly number[] = [0.50, 0.75, 0.90];
 /** Minimum tool-result size to mask. Below this, placeholder ≈ content → no win. */
 const MIN_MASK_LENGTH = 120;
 
-/** Command-invalidation rules: when `invalidator` command runs, any
- *  earlier output matching `invalidated` becomes stale. These still fire
- *  immediately regardless of cutoff — staleness is semantic, not
- *  position-based. */
-const INVALIDATION_RULES: readonly { invalidator: RegExp; invalidated: RegExp }[] = [
+/** Default command-invalidation rules: when `invalidator` command runs,
+ *  any earlier output matching `invalidated` becomes stale. These still
+ *  fire immediately regardless of cutoff — staleness is semantic, not
+ *  position-based.
+ *
+ *  v1.6.0: matched against `cd`-stripped command text. Matching is
+ *  further scoped by cwd tuple in `isCommandInvalidated`. */
+const DEFAULT_INVALIDATION_RULES: readonly { invalidator: RegExp; invalidated: RegExp }[] = [
   { invalidator: /^git\s+(add|rm|checkout|reset|stash|merge|rebase|cherry-pick)\b/, invalidated: /^git\s+status\b/ },
   { invalidator: /^git\s+(commit|merge|rebase)\b/, invalidated: /^git\s+(diff|log)\b/ },
   { invalidator: /^(npm|pnpm|yarn|bun)\s+(install|add|remove)\b/, invalidated: /^(npm|pnpm|yarn|bun)\s+(ls|list|outdated)\b/ },
   { invalidator: /^pip\s+install\b/, invalidated: /^pip\s+(list|freeze)\b/ },
 ];
 
-/** Basenames always treated as reference — never masked. */
-const REFERENCE_BASENAMES = new Set([
+/** Default basenames always treated as reference — never masked. */
+const DEFAULT_REFERENCE_BASENAMES: readonly string[] = [
   // Agent instructions
   "AGENTS.md", "CONVENTIONS.md", "CLAUDE.md", "GEMINI.md",
   "SKILL.md",
@@ -55,12 +59,10 @@ const REFERENCE_BASENAMES = new Set([
   "sgconfig.yml", ".shellcheckrc",
   // Project meta often re-read across a session
   "README.md", "CHANGELOG.md",
-]);
+];
 
-/** Path substrings — any file under these trees is reference.
- *  Covers Obsidian vault knowledge (ADRs, concepts, patterns),
- *  agent skills, and AST rule definitions. */
-const REFERENCE_PATH_SUBSTRINGS: readonly string[] = [
+/** Default path substrings — any file under these trees is reference. */
+const DEFAULT_REFERENCE_PATH_SUBSTRINGS: readonly string[] = [
   "/knowledge/decisions/",
   "/knowledge/concepts/",
   "/knowledge/patterns/",
@@ -69,10 +71,71 @@ const REFERENCE_PATH_SUBSTRINGS: readonly string[] = [
   "/rules/",
 ];
 
-function isReferenceFile(path: string): boolean {
+/** v1.6.0: strip iterative `cd <path> && ` prefixes, returning the
+ *  last-seen cwd (effective working directory after all chained cds)
+ *  and the residual command to match against invalidation regexes.
+ *
+ *  Pure function. Deterministic. Cache-safe. */
+export function parseCdPrefix(cmd: string): { cwd?: string; cmd: string } {
+  let cwd: string | undefined;
+  let current = cmd;
+  for (;;) {
+    const m = /^cd\s+(\S+)\s*&&\s*(.+)$/s.exec(current);
+    if (!m) break;
+    cwd = m[1];
+    current = m[2];
+  }
+  return { cwd, cmd: current };
+}
+
+// ── v1.6.0 config + rule resolution (pure, no IO) ──
+
+/** User-supplied config shape. Populated from JSON files by index.ts
+ *  (IO at the extension boundary; filter module stays pure). */
+export interface UserConfig {
+  referenceBasenames: string[];
+  referencePathSubstrings: string[];
+  invalidationRules: { invalidator: string; invalidated: string }[];
+  disableDefaults: boolean;
+}
+
+export function emptyUserConfig(): UserConfig {
+  return { referenceBasenames: [], referencePathSubstrings: [], invalidationRules: [], disableDefaults: false };
+}
+
+export interface ResolvedRules {
+  basenames: ReadonlySet<string>;
+  substrings: readonly string[];
+  invalidationRules: readonly { invalidator: RegExp; invalidated: RegExp }[];
+}
+
+/** Pure transform UserConfig → ResolvedRules. Compiles user regex
+ *  strings once; merges with or replaces defaults per disableDefaults. */
+export function resolveRules(user: UserConfig): ResolvedRules {
+  const baseNames = user.disableDefaults
+    ? user.referenceBasenames
+    : [...DEFAULT_REFERENCE_BASENAMES, ...user.referenceBasenames];
+  const subs = user.disableDefaults
+    ? user.referencePathSubstrings
+    : [...DEFAULT_REFERENCE_PATH_SUBSTRINGS, ...user.referencePathSubstrings];
+  const userRules = user.invalidationRules.map((r) => ({
+    invalidator: new RegExp(r.invalidator),
+    invalidated: new RegExp(r.invalidated),
+  }));
+  const rules = user.disableDefaults
+    ? userRules
+    : [...DEFAULT_INVALIDATION_RULES, ...userRules];
+  return { basenames: new Set(baseNames), substrings: subs, invalidationRules: rules };
+}
+
+/** Built-in default rules — used when caller doesn't inject a config.
+ *  index.ts loads user JSON and overrides via opts.rules. */
+const DEFAULT_RULES: ResolvedRules = resolveRules(emptyUserConfig());
+
+function isReferenceFile(path: string, rules: ResolvedRules): boolean {
   const base = path.split("/").pop() ?? path;
-  if (REFERENCE_BASENAMES.has(base)) return true;
-  for (const sub of REFERENCE_PATH_SUBSTRINGS) {
+  if (rules.basenames.has(base)) return true;
+  for (const sub of rules.substrings) {
     if (path.includes(sub)) return true;
   }
   return false;
@@ -122,6 +185,9 @@ export interface CompressOptions {
    *  messages.length-at-entry * coverage[zone]. Prevents drift when
    *  messages.length keeps growing past a threshold. */
   zoneEntered?: number;
+  /** v1.6.0: override the module-level DEFAULT_RULES. Tests inject a
+   *  custom ResolvedRules here; prod callers leave unset. */
+  rules?: ResolvedRules;
 }
 
 export interface CutoffDecision {
@@ -181,6 +247,7 @@ export function compressStaleToolResults(
   messages: any[],
   opts: CompressOptions = {},
 ): CompressResult | null {
+  const rules = opts.rules ?? DEFAULT_RULES;
   const { cutoffIdx } = decideCutoff(messages.length, opts);
 
   if (cutoffIdx <= 0) return null;
@@ -203,7 +270,7 @@ export function compressStaleToolResults(
 
       const command = extractCommand(msg, toolCallIndex);
       const pastCutoff = idx < cutoffIdx;
-      const invalidated = !pastCutoff && isCommandInvalidated(command, messages, idx, toolCallIndex);
+      const invalidated = !pastCutoff && isCommandInvalidated(command, messages, idx, toolCallIndex, rules);
 
       if (pastCutoff || invalidated) {
         const placeholder = command
@@ -221,7 +288,7 @@ export function compressStaleToolResults(
       const path = extractPath(msg, toolCallIndex);
       const content = extractTextContent(msg);
 
-      if (path && content.length >= MIN_MASK_LENGTH && !isReferenceFile(path) && idx < cutoffIdx) {
+      if (path && content.length >= MIN_MASK_LENGTH && !isReferenceFile(path, rules) && idx < cutoffIdx) {
         // v1.4.0: enrich read placeholder with deterministic size/line
         // metadata so the model can decide whether to re-read without
         // actually re-reading. Derived purely from the original content
@@ -244,10 +311,15 @@ export function compressStaleToolResults(
   return { messages: result, bytesSaved, masksApplied, cutoffIdx, maskedPaths, maskedCommands };
 }
 
-/** Scan messages, return Map<toolCallId, {command, path}> from assistant
- *  toolCall blocks. Handles live + persisted shapes. */
-function buildToolCallIndex(messages: any[]): Map<string, { command?: string; path?: string }> {
-  const idx = new Map<string, { command?: string; path?: string }>();
+/** Scan messages, return Map<toolCallId, {command, path, cwd}> from
+ *  assistant toolCall blocks. `command` is the RAW tool-call argument
+ *  (preserved for the bash placeholder, which wants the cd-prefix
+ *  visible to the model). `cwd` is parsed from a `cd X && ` prefix
+ *  and used for invalidation scoping.
+ *  Handles live + persisted shapes. */
+type ToolCallEntry = { command?: string; path?: string; cwd?: string };
+function buildToolCallIndex(messages: any[]): Map<string, ToolCallEntry> {
+  const idx = new Map<string, ToolCallEntry>();
   for (const m of messages) {
     const msg = m?.message ?? m;
     if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
@@ -256,28 +328,43 @@ function buildToolCallIndex(messages: any[]): Map<string, { command?: string; pa
       const id = block.id ?? block.toolCallId;
       if (!id) continue;
       const args = block.arguments ?? block.input ?? {};
+      const rawCmd = typeof args.command === "string" ? args.command : undefined;
+      const cwd = rawCmd ? parseCdPrefix(rawCmd).cwd : undefined;
       idx.set(id, {
-        command: typeof args.command === "string" ? args.command : undefined,
+        command: rawCmd,
         path: typeof args.path === "string" ? args.path : undefined,
+        cwd,
       });
     }
   }
   return idx;
 }
 
+/** v1.6.0: cwd-aware invalidation.
+ *
+ *  Both the candidate (self) and each later command are stripped of
+ *  their `cd X && ` prefixes before regex matching. Invalidation fires
+ *  only when their cwds match exactly. `undefined === undefined` counts
+ *  as a match (the common single-cwd case where neither command has
+ *  explicit cd), so existing sessions behave identically. Cross-cwd
+ *  cases (mvdirty's multi-repo pattern) no longer spuriously invalidate. */
 function isCommandInvalidated(
   command: string,
   messages: any[],
   fromIdx: number,
-  toolCallIndex: Map<string, { command?: string; path?: string }>,
+  toolCallIndex: Map<string, ToolCallEntry>,
+  rules: ResolvedRules,
 ): boolean {
-  const applicable = INVALIDATION_RULES.filter((r) => r.invalidated.test(command));
+  const self = parseCdPrefix(command);
+  const applicable = rules.invalidationRules.filter((r) => r.invalidated.test(self.cmd));
   if (applicable.length === 0) return false;
   for (let i = fromIdx + 1; i < messages.length; i++) {
     const later = messages[i]?.message ?? messages[i];
     if (!isBashToolResult(later)) continue;
-    const laterCmd = extractCommand(later, toolCallIndex);
-    if (applicable.some((r) => r.invalidator.test(laterCmd))) return true;
+    const laterRaw = extractCommand(later, toolCallIndex);
+    const laterParsed = parseCdPrefix(laterRaw);
+    if (self.cwd !== laterParsed.cwd) continue;
+    if (applicable.some((r) => r.invalidator.test(laterParsed.cmd))) return true;
   }
   return false;
 }
@@ -296,13 +383,13 @@ function isAlreadyMasked(msg: any): boolean {
   return text.startsWith("[masked ") || text.startsWith("[compressed]");
 }
 
-function extractCommand(msg: any, toolCallIndex?: Map<string, { command?: string; path?: string }>): string {
+function extractCommand(msg: any, toolCallIndex?: Map<string, ToolCallEntry>): string {
   const fromDetails = msg?.details?.command ?? msg?.input?.command;
   if (fromDetails) return fromDetails;
   if (toolCallIndex && msg?.toolCallId) return toolCallIndex.get(msg.toolCallId)?.command ?? "";
   return "";
 }
-function extractPath(msg: any, toolCallIndex?: Map<string, { command?: string; path?: string }>): string {
+function extractPath(msg: any, toolCallIndex?: Map<string, ToolCallEntry>): string {
   const fromDetails = msg?.details?.path ?? msg?.input?.path;
   if (fromDetails) return fromDetails;
   if (toolCallIndex && msg?.toolCallId) return toolCallIndex.get(msg.toolCallId)?.path ?? "";

@@ -1,6 +1,6 @@
 {
   "name": "@tomooshi/condensed-milk-pi",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Semantic token compression for pi terminal — filters noisy bash output and retroactively masks stale tool results in conversation history (per JetBrains Dec 2025 + Anthropic tool-result clearing)",
   "author": "tomooshi",
   "license": "MIT",

@@ -32,7 +32,14 @@ import "./filters/build.js";
 import "./filters/test-runners.js";
 import "./filters/install.js";
 import { filterJsonOutput } from "./filters/json-schema.js";
-import { compressStaleToolResults, decideCutoff } from "./filters/context-compress.js";
+import {
+  compressStaleToolResults,
+  decideCutoff,
+  resolveRules,
+  emptyUserConfig,
+  type UserConfig,
+  type ResolvedRules,
+} from "./filters/context-compress.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 
 // --- Config ---
@@ -82,6 +89,43 @@ function saveConfig(cfg: CompressorConfig): void {
     // Non-fatal — config just won't persist
   }
 }
+
+// v1.6.0: user-supplied reference paths and invalidation rules.
+// Separate file from CONFIG_PATH because the shape is different and
+// we want project-local overrides — which the cutoff config doesn't
+// support by design (cache stability requires a single source of truth).
+const USER_RULES_GLOBAL_PATH = join(homedir(), ".pi", "agent", "condensed-milk-config.json");
+function userRulesProjectPath(): string {
+  return join(process.cwd(), "condensed-milk.config.json");
+}
+
+/** Merge user-supplied rule config from global + project-local files.
+ *  ENOENT: skip silently (optional files). Any other read error or
+ *  JSON parse error: throw — fail loud on malformed config rather
+ *  than silently running with wrong rules. */
+function loadUserRulesConfig(): UserConfig {
+  const cfg = emptyUserConfig();
+  for (const p of [USER_RULES_GLOBAL_PATH, userRulesProjectPath()]) {
+    let raw: string;
+    try {
+      raw = readFileSync(p, "utf-8");
+    } catch (e: any) {
+      if (e?.code === "ENOENT") continue;
+      throw new Error(`condensed-milk: cannot read rules config '${p}': ${e?.message ?? e}`);
+    }
+    const c = JSON.parse(raw);
+    if (Array.isArray(c.referenceBasenames)) cfg.referenceBasenames.push(...c.referenceBasenames);
+    if (Array.isArray(c.referencePathSubstrings)) cfg.referencePathSubstrings.push(...c.referencePathSubstrings);
+    if (Array.isArray(c.invalidationRules)) cfg.invalidationRules.push(...c.invalidationRules);
+    if (c.disableDefaults === true) cfg.disableDefaults = true;
+  }
+  return cfg;
+}
+
+// Resolved once at extension load. pi reloads the extension on each
+// session start, so cwd-based project-local config is captured per
+// session — good enough for the single-cwd-per-session common case.
+const USER_RULES: ResolvedRules = resolveRules(loadUserRulesConfig());
 
 // --- Per-turn telemetry ---
 interface TurnCacheData {
@@ -289,6 +333,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       contextUsage,
       previousCutoff: persistentCutoff,
       zoneEntered,
+      rules: USER_RULES,
     });
     const turnBytesCompressed = result?.bytesSaved ?? 0;
     const turnMasksApplied = result?.masksApplied ?? 0;

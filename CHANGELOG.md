@@ -2,6 +2,90 @@
 
 All notable changes to condensed-milk.
 
+## [1.6.0] - 2026-04-17
+
+### Fixed — cd-prefix invisibility + cwd-unaware invalidation
+
+The v1.5.x invalidation regexes anchored at `^git`, which meant
+`cd /repo && git commit` never matched as an invalidator — a silent
+miss in the most common bash idiom the agent uses. Even once stripped,
+matching ignored cwd, so multi-repo sessions could see repo A's commit
+spuriously invalidate repo B's git status output.
+
+**Fix (parseCdPrefix):** iterative `cd X && cd Y && CMD` parsing. Last
+cd wins as effective cwd; residual command is what regex rules match.
+
+**Fix (cwd scoping):** `buildToolCallIndex` records cwd per bash call.
+`isCommandInvalidated` compares the candidate's cwd against each later
+invalidator's cwd; invalidation fires only on exact match (including
+both-undefined for the single-cwd no-cd common case). Cross-cwd
+mismatches no longer invalidate — err toward keeping output visible.
+
+### Added — user-configurable rules
+
+Global `~/.pi/agent/condensed-milk-config.json` + project-local
+`./condensed-milk.config.json` (merged additively):
+
+```json
+{
+  "referenceBasenames": ["spec.yaml"],
+  "referencePathSubstrings": ["/my-specs/"],
+  "invalidationRules": [
+    { "invalidator": "^cargo\\s+(build|update)", "invalidated": "^cargo\\s+(check|clippy)" }
+  ],
+  "disableDefaults": false
+}
+```
+
+`disableDefaults: true` replaces built-ins instead of extending; any
+file setting it wins.
+
+**Fail-loud:** ENOENT is skipped (optional files). Any other read
+error or JSON parse error throws — better than silently running with
+wrong rules.
+
+### Architecture
+
+Filter module (`filters/context-compress.ts`) stays pure — no fs IO.
+All file reads happen in `index.ts` at extension load; resolved rules
+are passed into `compressStaleToolResults` via `opts.rules`. Tests
+inject rules the same way, no subprocess or fs mocking needed.
+
+### Cache-safety
+
+Sweep on 926-msg session, default T.20/.35/.50 × C.50/.75/.90:
+variants 42 → 42, cost unchanged. Parsing is deterministic per
+command; cwd scope strictly narrows invalidation (fewer false
+positives never more).
+
+### Tests
+
+6 new v1.6.0 assertions in `test-rereads.mjs`:
+
+- `parseCdPrefix` bare, single, chained cds
+- cd-prefix invalidation now fires (git add invalidates git status
+  with cd prefix)
+- cwd scoping blocks cross-repo invalidation
+- user-config `referenceBasenames` protect custom paths
+- user-config `invalidationRules` fire (cargo build invalidates
+  cargo check)
+- `disableDefaults` suppresses built-in git rule
+
+### Stacked-diff tool notes
+
+Built-in rules only match `git`. Tools like `gt` (Graphite), `jj`
+(Jujutsu), `spr`, `sapling` are NOT invalidators by default — same as
+pre-v1.6.0. Users can add custom rules via config, e.g.:
+
+```json
+{ "invalidationRules": [
+  { "invalidator": "^gt\\s+(up|down|submit|checkout|sync|restack)", "invalidated": "^git\\s+(status|diff|log)" }
+]}
+```
+
+Cwd-scope protects the common multi-repo case: a `gt submit` in
+`/repoA` won't invalidate `git status` in `/repoB`.
+
 ## [1.5.0] - 2026-04-17
 
 ### Changed — expanded reference-file protection

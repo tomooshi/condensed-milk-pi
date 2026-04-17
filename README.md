@@ -80,13 +80,38 @@ The `env`/`printenv` filter masks values for keys containing `KEY`, `SECRET`, `T
 
 ## Install
 
+### Recommended: via `pi install` (pi package manager)
+
+```bash
+pi install npm:@tomooshi/condensed-milk-pi
+```
+
+Registers the package in `~/.pi/agent/settings.json` and auto-loads on every session. Updatable with `pi update`, removable with `pi remove npm:@tomooshi/condensed-milk-pi`.
+
+### Alternative: raw npm install
+
 ```bash
 npm i -g @tomooshi/condensed-milk-pi
 ```
 
-Then reload pi (Ctrl+R) or restart.
+Works if your pi setup autoloads global npm modules. Reload pi (Ctrl+R) or restart.
 
-(Alternatively, clone-and-symlink: `git clone https://github.com/tomooshi/condensed-milk-pi.git ~/condensed-milk-pi && ln -s ~/condensed-milk-pi ~/.pi/agent/extensions/condensed-milk`.)
+### Alternative: clone-and-symlink (for local hacking)
+
+```bash
+git clone https://github.com/tomooshi/condensed-milk-pi.git ~/condensed-milk-pi
+ln -s ~/condensed-milk-pi ~/.pi/agent/extensions/condensed-milk
+```
+
+Use this when you want to modify the source yourself — pi will auto-discover the symlink and hot-reload via `/reload`.
+
+### Verify
+
+```bash
+npm ls -g @tomooshi/condensed-milk-pi
+```
+
+Confirms the installed version. After install, run `/compress-stats` inside pi — you should see a `Re-read Telemetry` block. Telemetry shape is stable since v1.4.0 so the header doesn't bump per minor version; the installed `package.json` version is the source of truth.
 
 ## Usage
 
@@ -305,7 +330,7 @@ These filters exist in [ztk](https://github.com/codejunkie99/ztk) but are intent
 | Traceback compression | ❌ | ❌ (pytest only) | ✅ Generic Python traceback (first 2 + last 2 frames) |
 | Performance | ⚡ Zig + SIMD | ⚡ Rust | Fast enough (TypeScript on <50KB post-truncation) |
 | Stack coverage | Broad (Rust, Go, Zig, Docker, K8s) | Very broad (60+ TOML filters) | Python/TypeScript/Git focused |
-| Install | Homebrew / zig build | Homebrew / cargo install | Copy to ~/.pi/agent/extensions/ |
+| Install | Homebrew / zig build | Homebrew / cargo install | `pi install npm:@tomooshi/condensed-milk-pi` or `npm i -g @tomooshi/condensed-milk-pi` |
 
 ### Where Condensed Milk wins
 

@@ -126,7 +126,7 @@ The extension works automatically — no configuration needed. Every bash comman
 | Command | Description |
 |---------|-------------|
 | `/compress-stats` | Show compression + masking statistics for the current session, including re-read telemetry (v1.4.0) |
-| `/compress-config` | Show or update thresholds/coverage (`thresholds 0.15,0.30,0.45`, `coverage 0.5,0.75,0.9`) |
+| `/compress-config` | Show or update thresholds/coverage/statusbar (`thresholds 0.15,0.30,0.45`, `coverage 0.5,0.75,0.9`, `status on\|off`) |
 
 ### Status Bar
 
@@ -143,7 +143,8 @@ Controls when and how aggressively masking fires. Single source of truth for cac
 ```json
 {
   "thresholds": [0.30, 0.45, 0.60],
-  "coverage":   [0.60, 0.80, 0.95]
+  "coverage":   [0.60, 0.80, 0.95],
+  "showStatus": true
 }
 ```
 
@@ -153,6 +154,7 @@ v1.8.0 auto-migrates configs matching any recognized prior default tuple (e.g. v
 |---|---|
 | `thresholds` | Context-usage fractions (0..1) that trigger cutoff advancement. Monotonically increasing. |
 | `coverage` | Fraction of messages masked when each threshold fires. Same length as `thresholds`. |
+| `showStatus` | Publish `↓N (Cf)` token-savings indicator to the pi status bar. Default `true`. Orthogonal to compression — only controls the footer. |
 
 Also editable via `/compress-config`. Changes take effect on next session.
 

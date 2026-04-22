@@ -4,6 +4,42 @@ All notable changes to condensed-milk.
 
 ## [1.9.0] - 2026-04-21
 
+### Fixed — compound-command stdout over-masking (ADR-030)
+
+**Bug.** Multi-segment bash commands whose final segment matched a prefix
+filter had their ENTIRE concatenated stdout replaced by the filter's
+compressed output. Example:
+
+```
+$ cd /repo && git init && git add -A && git status --short | head -10 \
+  && echo "..." && git status --short | wc -l
+  on unknown: clean
+```
+
+`dispatch` matched the last `git status` segment in reverse-order and ran
+`filterGitStatus` against the combined output of all six commands. Parsing
+fell through to default `v2`, counted nothing, emitted `on unknown: clean`
+— hiding init messages, file listings, and the `wc` count the user wanted.
+
+**Fix — two defensive layers:**
+
+1. **Dispatch guard** (`filters/dispatch.ts`). New `SILENT_COMMANDS`
+   allowlist (`cd`, `export`, `set`, `unset`, `source`, `.`, `true`,
+   `false`, `:`). When the compound has ≥ 2 *non-silent* segments, skip
+   all prefix filters and only run content-based fallbacks.
+
+2. **Git-status confident detection** (`filters/git-status.ts`).
+   `detectFormat` no longer defaults eagerly. Returns `null` unless it
+   observes a v2 header (`# branch.`), a v1 header (`## `), a plain
+   header (`On branch `), or ≥ 2 v1-short-format lines (2-char porcelain
+   code + space + path). `filterGitStatus` returns `null` on null format.
+
+Preserves legitimate `cd repo && git status` compression (single
+non-silent segment). Loses compression on dual-producer chains like
+`git add . && git commit -m`, accepted tradeoff.
+
+New regression test: `test-compound-cmd.mjs` (4/4 PASS).
+
 ### Changed — self-documenting mask placeholders (ADR-029, issue #2)
 
 **Problem.** Fresh agents parachuted into a session via `context_checkout`

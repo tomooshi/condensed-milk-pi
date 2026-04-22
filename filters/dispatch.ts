@@ -44,12 +44,48 @@ export function registerFilter(
  * is split on &&/||/; and each segment is checked. The LAST matching segment
  * wins (it produced the final output).
  */
+// v1.9.0 (ADR-029 follow-up): a compound command with multiple
+// output-producing segments gives us a concatenated stdout that no
+// single per-command filter can interpret safely. Only these commands
+// are known to produce no visible output or only trivially short
+// output, so their presence in a chain is ignorable for producer
+// counting.
+const SILENT_COMMANDS = new Set([
+  "cd", "export", "set", "unset", "source", ".",
+  "true", "false", ":",
+]);
+function firstWord(seg: string): string {
+  const trimmed = seg.trim();
+  const sp = trimmed.indexOf(" ");
+  return sp < 0 ? trimmed : trimmed.slice(0, sp);
+}
+function isSilentSegment(seg: string): boolean {
+  return SILENT_COMMANDS.has(firstWord(seg));
+}
+
 export function dispatch(command: string, stdout: string): FilterResult | null {
   // Skip tiny outputs — compression overhead exceeds savings
   if (stdout.length < 80) return null;
 
   // Split compound commands and try each segment
   const segments = splitCompoundCommand(command);
+
+  // v1.9.0 (ADR-029 follow-up): when the compound has ≥2 non-silent
+  // segments, the captured stdout is a concatenation of multiple
+  // commands' outputs. Per-command prefix filters would misinterpret
+  // non-matching bytes (e.g. `bd update … && git status` produced
+  // 'on unknown: clean' because git-status parsing ran on the combined
+  // stdout). Fall through to content fallbacks instead.
+  const nonSilentSegments = segments.filter(
+    (s) => s.trim().length > 0 && !isSilentSegment(s),
+  );
+  if (nonSilentSegments.length >= 2) {
+    for (const fb of contentFallbacks) {
+      const result = fb.filter(stdout, command);
+      if (result && result.output.length < stdout.length) return result;
+    }
+    return null;
+  }
 
   // Try segments in reverse — last command in chain produced the output
   for (let i = segments.length - 1; i >= 0; i--) {

@@ -19,9 +19,18 @@ function filterGitStatus(input: string): FilterResult | null {
   if (input.length === 0) return { output: "git status: no output", category: "fast" };
   if (input.length < 80) return null; // Already compact
 
+  // v1.9.0 (ADR-029 follow-up): confident-detection guard. When dispatch
+  // routes us the combined stdout of a compound command (e.g.
+  // `bd update … && git status`), the non-git-status bytes at the start
+  // used to trip detectFormat into a default 'v2' interpretation, then
+  // parsing counted nothing and we emitted 'on unknown: clean' — hiding
+  // the user's real output. Require at least one git-status marker
+  // anywhere in the input before we're willing to compress.
+  const format = detectFormat(input);
+  if (format === null) return null;
+
   const counts: Counts = { branch: "unknown", staged: 0, modified: 0, untracked: 0, conflicted: 0 };
   const files: string[] = [];
-  const format = detectFormat(input);
 
   const lines = input.split("\n");
   for (const line of lines) {
@@ -67,17 +76,29 @@ function filterGitStatus(input: string): FilterResult | null {
 
 type Format = "v2" | "v1" | "plain";
 
-function detectFormat(input: string): Format {
+// v1 --short status lines look like two-char code + space + path, where
+// each code char is one of the known git porcelain status codes. Used as
+// a confidence marker when no format header is present.
+const STATUS_CODES = new Set([" ", "M", "A", "D", "R", "C", "U", "?", "!", "T"]);
+function looksLikeV1Line(line: string): boolean {
+  if (line.length < 4) return false;
+  if (line[2] !== " ") return false;
+  return STATUS_CODES.has(line[0]) && STATUS_CODES.has(line[1]);
+}
+
+function detectFormat(input: string): Format | null {
   const lines = input.split("\n");
+  let v1Hits = 0;
   for (const line of lines) {
     if (line.length === 0) continue;
     if (line.startsWith("# branch.")) return "v2";
     if (line.startsWith("## ")) return "v1";
     if (line.startsWith("On branch ")) return "plain";
-    if (line.length > 2 && line[2] === " ") return "v1";
-    return "v2";
+    if (looksLikeV1Line(line)) v1Hits++;
   }
-  return "v1";
+  // Confident v1 only if multiple status-format lines observed anywhere.
+  // Single-hit could be a coincidental line in non-git output.
+  return v1Hits >= 2 ? "v1" : null;
 }
 
 function countV2(c1: string, c2: string, counts: Counts): void {

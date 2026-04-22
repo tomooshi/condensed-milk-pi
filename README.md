@@ -76,6 +76,8 @@ source .venv/bin/activate && python -m pytest -q 2>&1 | tail -3 && ruff check sr
 
 The dispatcher splits on `&&`/`||`/`;`, strips pipe tails (`| head`, `| tail`, `| wc`), cleans env vars and redirects, then matches each segment against registered filters. Last matching segment wins (it produced the output).
 
+**Multi-producer guard (v1.9.0, ADR-030).** If the compound has ≥ 2 *non-silent* segments (anything not in the allowlist `cd / export / set / unset / source / . / true / false / :`), prefix filters are skipped and the raw stdout passes through. Otherwise a filter matching the tail segment would be handed the combined stdout of every prior command and parse it as if it were its own format — the symptom was `cd repo && git init && git add -A && git status --short | head -10 && echo "..." && git status --short | wc -l` collapsing to `on unknown: clean`. Content-based fallbacks (JSON etc.) still run. Single-segment compounds like `cd repo && git status` are unaffected (one non-silent segment).
+
 ### Secret Masking
 
 The `env`/`printenv` filter masks values for keys containing `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `API`, `AUTH`, or `CREDENTIAL`. This prevents API keys and secrets from entering the LLM context window.

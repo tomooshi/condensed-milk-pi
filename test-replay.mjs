@@ -32,7 +32,7 @@ function isReadTR(m) { return m?.role === "toolResult" && m?.toolName === "read"
 function isAlreadyMasked(m) {
   if (m?.role !== "toolResult") return false;
   const c = (m.content ?? [])[0];
-  return c?.type === "text" && (c.text?.startsWith("[masked ") || c.text?.startsWith("[compressed]"));
+  return c?.type === "text" && (c.text?.startsWith("[cm-masked ") || c.text?.startsWith("[compressed]"));
 }
 function textContent(m) {
   return (m?.content ?? []).filter(c => c?.type === "text").map(c => c.text ?? "").join("\n");
@@ -84,14 +84,14 @@ function maskRolling(messages, windowSize) {
       if (c.length < MIN_MASK_LENGTH) return m;
       if (idx < staleBeforeIdx) {
         const cmd = extractCommand(msg, toolCallIdx);
-        return replaceContent(m, cmd ? `[masked bash] ${cmd.slice(0, 80)}` : `[masked bash]`);
+        return replaceContent(m, cmd ? `[cm-masked bash] ${cmd.slice(0, 80)}` : `[cm-masked bash]`);
       }
     }
     if (isReadTR(msg) && !msg.isError) {
       const p = extractPath(msg, toolCallIdx);
       const c = textContent(msg);
       if (p && c.length >= MIN_MASK_LENGTH && !isReferenceFile(p) && idx < staleBeforeIdx) {
-        return replaceContent(m, `[masked read] ${p}`);
+        return replaceContent(m, `[cm-masked read] ${p}`);
       }
     }
     return m;
@@ -113,13 +113,13 @@ function maskStaticCutoff(messages, cutoffIdx) {
       const c = textContent(msg);
       if (c.length < MIN_MASK_LENGTH) return m;
       const cmd = extractCommand(msg, toolCallIdx);
-      return replaceContent(m, cmd ? `[masked bash] ${cmd.slice(0, 80)}` : `[masked bash]`);
+      return replaceContent(m, cmd ? `[cm-masked bash] ${cmd.slice(0, 80)}` : `[cm-masked bash]`);
     }
     if (isReadTR(msg) && !msg.isError) {
       const p = extractPath(msg, toolCallIdx);
       const c = textContent(msg);
       if (p && c.length >= MIN_MASK_LENGTH && !isReferenceFile(p)) {
-        return replaceContent(m, `[masked read] ${p}`);
+        return replaceContent(m, `[cm-masked read] ${p}`);
       }
     }
     return m;

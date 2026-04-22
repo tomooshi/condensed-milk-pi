@@ -298,9 +298,13 @@ export function compressStaleToolResults(
       const invalidated = !pastCutoff && isCommandInvalidated(command, messages, idx, toolCallIndex, rules);
 
       if (pastCutoff || invalidated) {
+        // v1.9.0 (ADR-029): `cm-` prefix brands placeholder as a
+        // condensed-milk artifact (not a tool failure) — self-documenting
+        // for self-sufficient looping agents who only see placeholder text
+        // post-context_checkout. Bytes stay deterministic per message.
         const placeholder = command
-          ? `[masked bash] ${command.slice(0, 80)}`
-          : `[masked bash]`;
+          ? `[cm-masked bash] ${command.slice(0, 80)}`
+          : `[cm-masked bash]`;
         bytesSaved += content.length - placeholder.length;
         masksApplied++;
         if (command) maskedCommands.push(command);
@@ -320,7 +324,8 @@ export function compressStaleToolResults(
         // → byte-identical per message → cache prefix stays stable.
         const lineCount = countLines(content);
         const sizeStr = formatSize(content.length);
-        const placeholder = `[masked read] ${path} (${lineCount} lines, ${sizeStr})`;
+        // v1.9.0 (ADR-029): `cm-` prefix (see bash branch above).
+        const placeholder = `[cm-masked read] ${path} (${lineCount} lines, ${sizeStr})`;
         bytesSaved += content.length - placeholder.length;
         masksApplied++;
         maskedPaths.push(path);
@@ -405,7 +410,13 @@ function isAlreadyMasked(msg: any): boolean {
   const content = (msg.content ?? [])[0];
   if (!content || content.type !== "text") return false;
   const text = content.text ?? "";
-  return text.startsWith("[masked ") || text.startsWith("[compressed]");
+  // v1.9.0 (ADR-029): accept `[cm-masked ` (current) and `[masked `
+  // (pre-v1.9.0 legacy, persisted in older session files on disk).
+  return (
+    text.startsWith("[cm-masked ") ||
+    text.startsWith("[masked ") ||
+    text.startsWith("[compressed]")
+  );
 }
 
 function extractCommand(msg: any, toolCallIndex?: Map<string, ToolCallEntry>): string {

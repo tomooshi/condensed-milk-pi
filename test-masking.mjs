@@ -42,7 +42,7 @@ function isAlreadyMasked(msg) {
   const content = (msg.content ?? [])[0];
   if (!content || content.type !== "text") return false;
   const text = content.text ?? "";
-  return text.startsWith("[masked ") || text.startsWith("[compressed]");
+  return text.startsWith("[cm-masked ") || text.startsWith("[compressed]");
 }
 function buildToolCallIndex(messages) {
   const idx = new Map();
@@ -100,7 +100,7 @@ function compressStaleToolResults(messages, windowSize = DEFAULT_WINDOW) {
       if (content.length < MIN_MASK_LENGTH) return m;
       if (idx < staleBeforeIdx) {
         const cmd = extractCommand(msg, toolCallIndex);
-        const placeholder = cmd ? `[masked bash] ${cmd.slice(0, 80)}` : `[masked bash]`;
+        const placeholder = cmd ? `[cm-masked bash] ${cmd.slice(0, 80)}` : `[cm-masked bash]`;
         bytesSaved += content.length - placeholder.length;
         masksApplied++;
         return { ...m, message: { ...msg, content: [{ type: "text", text: placeholder }] } };
@@ -111,7 +111,7 @@ function compressStaleToolResults(messages, windowSize = DEFAULT_WINDOW) {
       const path = extractPath(msg, toolCallIndex);
       const content = extractTextContent(msg);
       if (path && content.length >= MIN_MASK_LENGTH && !isReferenceFile(path) && idx < staleBeforeIdx) {
-        const placeholder = `[masked read] ${path}`;
+        const placeholder = `[cm-masked read] ${path}`;
         bytesSaved += content.length - placeholder.length;
         masksApplied++;
         return { ...m, message: { ...msg, content: [{ type: "text", text: placeholder }] } };
@@ -180,7 +180,7 @@ for (let i = 0; i < result.messages.length && shown < 3; i++) {
 // ---- Assertions ----
 let failed = 0;
 
-// 1. Every masked message should start with "[masked "
+// 1. Every masked message should start with "[cm-masked "
 for (let i = 0; i < result.messages.length; i++) {
   const origRaw = messages[i];
   const newRaw = result.messages[i];
@@ -188,8 +188,8 @@ for (let i = 0; i < result.messages.length; i++) {
   const newMsg = newRaw.message ?? newRaw;
   if (newMsg.role !== "toolResult") continue;
   const text = extractTextContent(newMsg);
-  if (!text.startsWith("[masked ")) {
-    console.error(`FAIL: idx ${i} was changed but doesn't start with '[masked ': ${text.slice(0, 60)}`);
+  if (!text.startsWith("[cm-masked ")) {
+    console.error(`FAIL: idx ${i} was changed but doesn't start with '[cm-masked ': ${text.slice(0, 60)}`);
     failed++;
   }
 }

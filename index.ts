@@ -228,6 +228,19 @@ function loadUserRulesConfig(): UserConfig {
 // session — good enough for the single-cwd-per-session common case.
 const USER_RULES: ResolvedRules = resolveRules(loadUserRulesConfig());
 
+// v1.9.0 (ADR-029): constant system-prompt addendum that teaches a
+// self-sufficient looping agent what `[cm-masked …]` placeholders mean
+// and how to recover content. Module-level const — bytes MUST be
+// deterministic turn-over-turn so chained `before_agent_start`
+// systemPrompt contributions keep the cache prefix stable. Any future
+// edit here is a deliberate cache bust and MUST be ADR'd.
+const CM_EXPLAINER = `
+
+condensed-milk: tool results older than the current cutoff appear as
+\`[cm-masked bash|read] …\` to keep the prompt cache stable. Re-run the
+command or re-read the file to get current content. \`/compress-stats\`
+for details.`;
+
 // --- Per-turn telemetry ---
 interface TurnCacheData {
   turn: number;
@@ -242,6 +255,14 @@ interface TurnCacheData {
 export default function tokenCompressor(pi: ExtensionAPI) {
   // Register content-based fallback filters
   registerContentFallback("json", filterJsonOutput);
+
+  // v1.9.0 (ADR-029): append CM_EXPLAINER to every turn's system prompt.
+  // Chained by pi across extensions (per BeforeAgentStartEventResult docs)
+  // — safe to compose with other extensions contributing systemPrompt.
+  // Constant string → byte-identical turn-over-turn → cache-stable.
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: event.systemPrompt + CM_EXPLAINER,
+  }));
 
   // Subagents: compress too — they benefit from smaller output
   let totalOriginal = 0;
@@ -309,7 +330,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   // the masker's persistentCutoff is frozen at a pre-compact absolute index.
   // Without this reset, every post-compact tool_result sits below the stale
   // cutoff and gets masked (symptom: `cat file.md`, Read tool, etc. all return
-  // `[masked bash] <cmd>` / `[masked read] <path>` for fresh content).
+  // `[cm-masked bash] <cmd>` / `[cm-masked read] <path>` for fresh content;
+  // v1.9.0 (ADR-029) renamed the prefix from `[masked …]` to `[cm-masked …]`).
   // Reset all position-based state and re-enter zones naturally on next
   // context event that crosses a threshold.
   pi.on("session_compact", async (_event, _ctx) => {

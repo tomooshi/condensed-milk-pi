@@ -37,10 +37,12 @@ Pi's `context` event fires before every LLM call with a deep copy of the convers
 
 **Algorithm (v1.2.0+ static cutoff, ADR-018):** a cutoff index T advances only when context usage crosses a pressure threshold. Between advances T is immutable — bytes before T stay byte-identical turn-over-turn — cache prefix stable. Defaults: thresholds `[0.20, 0.35, 0.50]` of context used, coverage `[0.50, 0.75, 0.90]` of messages masked at each zone.
 
-**Placeholders:**
+**Placeholders (v1.9.0, ADR-029):**
 
-- `[masked bash] <command truncated to 80 chars>` — for bash results
-- `[masked read] <path> (N lines, SIZE)` — for read results (v1.4.0: size metadata helps the model decide whether to re-read)
+- `[cm-masked bash] <command truncated to 80 chars>` — for bash results
+- `[cm-masked read] <path> (N lines, SIZE)` — for read results (v1.4.0: size metadata helps the model decide whether to re-read)
+
+The `cm-` prefix brands the placeholder as a condensed-milk artifact so fresh agents (e.g. parachuted in via `context_checkout`) don't misread them as tool failures. v1.9.0 also appends a constant explainer to every turn's system prompt via `before_agent_start` so looping agents always know that `[cm-masked …]` means "re-run or re-read to get current content" — cache-stable (same bytes every turn) and amortized across the session regardless of how many items are masked. Legacy `[masked …]` placeholders in pre-v1.9.0 session files are still recognized by `/compress-stats` via back-compat prefix match.
 
 **Reference files are never masked.** v1.6.0 protects by basename set (`AGENTS.md`, `CONVENTIONS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `README.md`, `CHANGELOG.md`, `package.json`, `tsconfig.json`, `pyproject.toml`, `biome.json`, etc.) *and* by path substrings (`/knowledge/decisions/`, `/knowledge/concepts/`, `/knowledge/patterns/`, `/.pi/agent/skills/`, `/.pi/skills/`, `/rules/`). Add your own via config — see [Configuration](#configuration).
 

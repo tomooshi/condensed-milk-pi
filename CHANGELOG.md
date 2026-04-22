@@ -2,6 +2,60 @@
 
 All notable changes to condensed-milk.
 
+## [1.9.0] - 2026-04-21
+
+### Changed — self-documenting mask placeholders (ADR-029, issue #2)
+
+**Problem.** Fresh agents parachuted into a session via `context_checkout`
+misread `[masked bash] <cmd>` placeholders as tool failures. Reported by
+@quantfiction in [issue #2](https://github.com/tomooshi/condensed-milk-pi/issues/2):
+a fresh agent switched to `grep`/`read` workarounds (also masked, wasting
+turns), then hallucinated a "transient workspace UI rendering issue" to
+explain the inconsistency. Only identified the real cause when the user
+named the extension.
+
+**Fix — two coordinated changes:**
+
+1. **Placeholder prefix renamed** from `[masked …]` to `[cm-masked …]`:
+   - `[cm-masked bash] <command …>`
+   - `[cm-masked read] <path> (N lines, SIZE)`
+
+   The `cm-` prefix brands the placeholder as a condensed-milk artifact,
+   removing the "hidden / redacted / sandbox-blocked" connotation of bare
+   "masked". +3 bytes per placeholder, still byte-identical turn-over-turn.
+
+2. **`before_agent_start` system-prompt explainer.** A constant ~150 byte
+   addendum is appended to every turn's system prompt via pi's `before_agent_start`
+   event (chained across extensions per `BeforeAgentStartEventResult` contract).
+   The explainer tells the agent that `[cm-masked …]` means "re-run / re-read
+   to get current content". Amortized across the session: cost scales with
+   turns, not mask count. Survives `context_checkout` (pi rebuilds the
+   system prompt on resume) and `/pi-vcc` compaction.
+
+**Back-compat.** `isMaskedText()` accepts both `[cm-masked ` (current) and
+`[masked ` (legacy) prefixes, so `/compress-stats` counts remain correct
+for persisted pre-v1.9.0 session files.
+
+**Cache impact.** One-time KV prefix bust at upgrade boundary (old bytes
+→ new bytes on any live session). Steady-state cache stability is identical
+to v1.8.1 — both the placeholder and `CM_EXPLAINER` are deterministic
+module-level constants.
+
+**Token overhead (typical 50-mask session).** ~185 tokens per turn
+(+3 B × 50 placeholders + ~150 B explainer). ~1% of typical turn budget,
+negligible vs. mask savings.
+
+**Validation.** Eight-scenario real-session harness (`ug5u` bead) covers:
+placeholder format end-to-end, system-prompt visibility, parachute /
+`context_checkout`, cache-prefix byte stability (turn-diff), legacy
+back-compat on persisted sessions, post-`/pi-vcc` regression check,
+multi-extension `systemPrompt` chaining, and re-read telemetry baseline
+across 5 real sessions.
+
+Files: `filters/context-compress.ts` (placeholder strings + `isMaskedText`),
+`index.ts` (`CM_EXPLAINER` const + handler). No config-schema change,
+no new commands.
+
 ## [1.8.1] - 2026-04-18
 
 ### Fixed — post-`/pi-vcc` compaction masked ALL fresh tool output (ADR-028)

@@ -112,9 +112,9 @@ for (const m of maskedMsgs) {
   const msg = m?.message ?? m;
   if (msg?.role !== "toolResult" || msg?.toolName !== "read") continue;
   const text = msg.content?.[0]?.text ?? "";
-  if (!text.startsWith("[masked read]")) continue;
-  // Expected: "[masked read] /file/N.py (L lines, SIZE)"
-  const match = /^\[masked read\] (\S+) \((\d+) lines, ([\d.]+(?:B|KB|MB))\)$/.exec(text);
+  if (!text.startsWith("[cm-masked read]")) continue;
+  // Expected: "[cm-masked read] /file/N.py (L lines, SIZE)"
+  const match = /^\[cm-masked read\] (\S+) \((\d+) lines, ([\d.]+(?:B|KB|MB))\)$/.exec(text);
   if (!match) { console.error("FAIL: read placeholder format", text); process.exit(1); }
   readPlaceholdersChecked++;
 }
@@ -175,8 +175,8 @@ if (refResult) {
     const msg = m?.message ?? m;
     if (msg?.role !== "toolResult" || msg?.toolName !== "read") continue;
     const text = msg.content?.[0]?.text ?? "";
-    if (!text.startsWith("[masked read]")) continue;
-    const pathMatch = /^\[masked read\] (\S+)/.exec(text);
+    if (!text.startsWith("[cm-masked read]")) continue;
+    const pathMatch = /^\[cm-masked read\] (\S+)/.exec(text);
     const maskedPath = pathMatch?.[1];
     if (maskedPath && refPaths.includes(maskedPath)) {
       console.error("FAIL: reference path has masked placeholder:", maskedPath);
@@ -350,7 +350,7 @@ if (disableResult) {
     const msg = m?.message ?? m;
     if (msg?.role !== "toolResult" || msg?.toolName !== "bash") return false;
     const text = msg.content?.[0]?.text ?? "";
-    return /git status/.test(text) && text.startsWith("[masked");
+    return /git status/.test(text) && text.startsWith("[cm-masked");
   });
   if (postCutoffMasked) {
     console.error("FAIL: disableDefaults did not suppress built-in git rule (post-cutoff status masked)");

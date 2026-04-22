@@ -62,7 +62,7 @@ const isReadTR = (m) => m?.role === "toolResult" && m?.toolName === "read";
 function isAlreadyMasked(m) {
   if (m?.role !== "toolResult") return false;
   const c = (m.content ?? [])[0];
-  return c?.type === "text" && (c.text?.startsWith("[masked ") || c.text?.startsWith("[compressed]"));
+  return c?.type === "text" && (c.text?.startsWith("[cm-masked ") || c.text?.startsWith("[compressed]"));
 }
 const textContent = (m) => (m?.content ?? []).filter(c => c?.type === "text").map(c => c.text ?? "").join("\n");
 
@@ -122,7 +122,7 @@ function maybeMask(m, msgIdx, messages, toolCallIdx, pastCutoff, useInvalidation
     const cmd = extractCommand(msg, toolCallIdx);
     const inv = !pastCutoff && useInvalidation && bashInvalidated(cmd, msgIdx, messages, toolCallIdx);
     if (pastCutoff || inv) {
-      return replaceContent(m, cmd ? `[masked bash] ${cmd.slice(0, 80)}` : `[masked bash]`);
+      return replaceContent(m, cmd ? `[cm-masked bash] ${cmd.slice(0, 80)}` : `[cm-masked bash]`);
     }
     return null;
   }
@@ -135,7 +135,7 @@ function maybeMask(m, msgIdx, messages, toolCallIdx, pastCutoff, useInvalidation
       const size = c.length < 1024 ? `${c.length}B`
                  : c.length < 1048576 ? `${(c.length/1024).toFixed(1)}KB`
                  : `${(c.length/1048576).toFixed(1)}MB`;
-      return replaceContent(m, `[masked read] ${p} (${lines} lines, ${size})`);
+      return replaceContent(m, `[cm-masked read] ${p} (${lines} lines, ${size})`);
     }
     return null;
   }

@@ -59,11 +59,16 @@ interface CompressorConfig {
    *  mask when that threshold fires. Must match thresholds length.
    *  Default [0.60, 0.80, 0.95] as of v1.7.0. */
   coverage: number[];
+  /** Publish token-savings indicator to pi status bar via ctx.ui.setStatus.
+   *  Orthogonal to compression behavior — only controls the footer display.
+   *  Default true. Toggle via `/compress-config status on|off`. */
+  showStatus: boolean;
 }
 
 const DEFAULT_CONFIG: CompressorConfig = {
   thresholds: [0.30, 0.45, 0.60],
   coverage:   [0.60, 0.80, 0.95],
+  showStatus: true,
 };
 
 // v1.7.1 (ADR-026): recognized prior-version default tuples.
@@ -150,7 +155,8 @@ function loadConfig(): CompressorConfig {
     const coverage = isValidArr(parsed.coverage, thresholds.length)
       ? parsed.coverage
       : DEFAULT_CONFIG.coverage;
-    const cfg: CompressorConfig = { thresholds, coverage };
+    const showStatus = typeof parsed.showStatus === "boolean" ? parsed.showStatus : DEFAULT_CONFIG.showStatus;
+    const cfg: CompressorConfig = { thresholds, coverage, showStatus };
     // Auto-migrate stale defaults to current recommended values.
     // Preserves any non-matching config as explicit user customization.
     const staleLabel = matchesStaleDefault(cfg);
@@ -158,6 +164,7 @@ function loadConfig(): CompressorConfig {
       const migrated: CompressorConfig = {
         thresholds: [...DEFAULT_CONFIG.thresholds],
         coverage: [...DEFAULT_CONFIG.coverage],
+        showStatus,
       };
       saveConfig(migrated);
       try {
@@ -171,7 +178,7 @@ function loadConfig(): CompressorConfig {
     }
     return cfg;
   } catch {
-    return { thresholds: [...DEFAULT_CONFIG.thresholds], coverage: [...DEFAULT_CONFIG.coverage] };
+    return { thresholds: [...DEFAULT_CONFIG.thresholds], coverage: [...DEFAULT_CONFIG.coverage], showStatus: DEFAULT_CONFIG.showStatus };
   }
 }
 
@@ -184,6 +191,7 @@ function saveConfig(cfg: CompressorConfig): void {
     try { existing = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")); } catch { /* fresh */ }
     existing.thresholds = cfg.thresholds;
     existing.coverage = cfg.coverage;
+    existing.showStatus = cfg.showStatus;
     mkdirSync(dirname(CONFIG_PATH), { recursive: true });
     writeFileSync(CONFIG_PATH, JSON.stringify(existing, null, 2) + "\n");
   } catch {
@@ -323,7 +331,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     // in a previous session is honored without requiring full pi restart.
     telemetryConfig = loadTelemetryConfig();
     const cmds = registeredCommands();
-    ctx.ui?.setStatus?.("token-savings", `↓0 (${cmds.length}f)`);
+    if (config.showStatus) {
+      ctx.ui?.setStatus?.("token-savings", `↓0 (${cmds.length}f)`);
+    }
   });
 
   // v1.8.1 (ADR-028): /pi-vcc compaction collapses the messages array while
@@ -471,10 +481,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
 
     const totalSaved = totalOriginal - totalCompressed;
     const pct = totalOriginal > 0 ? Math.round((totalSaved / totalOriginal) * 100) : 0;
-    _ctx.ui?.setStatus?.(
-      "token-savings",
-      `↓${formatBytes(totalSaved)} ${compressedCount}/${totalCommands} ${pct}%`,
-    );
+    if (config.showStatus) {
+      _ctx.ui?.setStatus?.(
+        "token-savings",
+        `↓${formatBytes(totalSaved)} ${compressedCount}/${totalCommands} ${pct}%`,
+      );
+    }
 
     const content: Record<string, unknown>[] = [
       { type: "text" as const, text: finalOutput },
@@ -726,10 +738,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
             "Compressor Config (v1.2.0: static-cutoff masking)",
             `  thresholds: [${config.thresholds.join(", ")}]`,
             `  coverage:   [${config.coverage.join(", ")}]`,
+            `  statusbar:  ${config.showStatus ? "on" : "off"}`,
             "",
             "Usage:",
             "  /compress-config thresholds 0.30,0.45,0.60   # context-% triggers (monotonic)",
             "  /compress-config coverage 0.60,0.80,0.95     # mask fraction per trigger",
+            "  /compress-config status on|off               # token-savings footer toggle",
             "",
             "How it works: cutoff T advances only when context usage crosses a",
             "threshold. Bytes before T stay byte-identical turn-over-turn —",
@@ -776,7 +790,34 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         return;
       }
 
-      ctx.ui?.notify?.(`Unknown config key: ${key}. Use thresholds or coverage.`, "warning");
+      if (key === "status") {
+        const arg = value.trim().toLowerCase();
+        if (arg !== "on" && arg !== "off") {
+          ctx.ui?.notify?.("Usage: /compress-config status on|off", "warning");
+          return;
+        }
+        const show = arg === "on";
+        config.showStatus = show;
+        saveConfig(config);
+        if (show) {
+          // Re-publish current savings so footer reappears immediately.
+          const totalSaved = totalOriginal - totalCompressed;
+          const pct = totalOriginal > 0 ? Math.round((totalSaved / totalOriginal) * 100) : 0;
+          const label = totalCommands > 0
+            ? `↓${formatBytes(totalSaved)} ${compressedCount}/${totalCommands} ${pct}%`
+            : `↓0 (${registeredCommands().length}f)`;
+          ctx.ui?.setStatus?.("token-savings", label);
+        } else {
+          ctx.ui?.setStatus?.("token-savings", undefined);
+        }
+        ctx.ui?.notify?.(
+          show ? "compress statusbar on." : "compress statusbar off. Compression unchanged.",
+          "info",
+        );
+        return;
+      }
+
+      ctx.ui?.notify?.(`Unknown config key: ${key}. Use thresholds, coverage, or status.`, "warning");
     },
   });
 

@@ -2,6 +2,75 @@
 
 All notable changes to condensed-milk.
 
+## [1.11.0] - 2026-11-01
+
+Masked tool results can now be recalled exactly. Research, options and sources:
+`docs/research/2026-11-01-addressable-recall.md`. Decisions: `docs/adr/CM-ADR-001`
+and `docs/adr/CM-ADR-002`.
+
+### Added — addressable placeholders and `cm_recall`
+
+- Every placeholder carries a stable id: `[cm-masked bash #3f9a2c1d7e] git status
+  (412 lines, 23.4KB)`. The id is the first 10 hex characters of
+  `sha1(toolCallId + "\0" + timestamp)`. The timestamp is part of the key because
+  Kimi through OpenRouter reuses call ids such as `bash:0` in every turn (17
+  repeats on one branch); no (call id, timestamp) pair repeats in 28,279 results.
+- New tool `cm_recall`: `id` returns the original exactly as first shown (header
+  says "not the current state"); `grep`, `offset`, `limit` select part of it; `raw`
+  returns the text from before a condensed-milk filter; `match` lists ids by
+  command or path; `session` reads another pi session file read-only (streamed,
+  so 500 MB files work). The source of truth is the session branch, so recall
+  works after a restart and after compaction.
+- When a filter changes a bash result, the text from before the filter is kept
+  in the result's `details` (saved in the session file, never sent to the
+  model). The `env`/`printenv` filter hides secrets, so its raw text is never kept.
+- `cm_recall` results are masked past the cutoff like bash results
+  (`[cm-masked recall #id] …`).
+- Task-boundary trigger: the `pi.events` channel `condensed-milk:boundary`, the
+  `/cm-boundary` command, or a `boundaryCommands` regex in the rules config
+  (for example `"^bd close\\b"`) masks every result the model has seen, at the
+  next model call. Results after the newest assistant message stay.
+- Idle-aligned advance: when the time since the last cache touch is longer than
+  the prompt-cache lifetime, the next call enters the next zone (the cache is
+  rewritten anyway). Lifetime: `cacheTtlSeconds` in `~/.config/condensed-milk.json`,
+  else the model's `promptCache` tier (`PI_CACHE_RETENTION=long` → long). Unknown
+  lifetime = off. Both triggers apply only when they free at least 32 KB.
+- Telemetry schema 2 (opt-in, local): recall counts by mode, errors, bytes,
+  turns ago, recall followed by a re-run, boundary and idle events, and context
+  usage read failures. `/compress-stats` shows the same.
+
+### Changed — one deliberate cache bust (CM-ADR-001)
+
+- New placeholder bytes for bash, read and recall results, and a new system-prompt
+  explainer that names `cm_recall` and says when to recall and when to re-run.
+  Expect one cache miss per session after upgrading.
+- A bash result with an unknown command renders `(command unknown)`.
+- Placeholder substitution no longer interprets `$&`, `$1` or `$$` inside a
+  command or path.
+- A custom placeholder template without `{id}` still works, with a profile warning.
+
+### Fixed
+
+- The JSON content fallback was registered again on every session start, so the
+  fallback list grew by one entry per session. It is now replaced by name.
+- The telemetry write at shutdown no longer fails silently; it reports to stderr.
+
+### Measured
+
+- Replay on the 40 newest real sessions (up to 548 MB): 29,300 placeholders, every
+  id resolves to its original bytes, two masking passes are byte-identical.
+  Placeholder growth against 1.10 templates: size-weighted 0.041%, median 0.119%,
+  p90 0.354%, max 0.869% (a 15-message session). `node tests/replay-recall.mjs`.
+- `cm_recall({ session })` on a 548 MB session file: 0.73-0.81 s per call, 177 MB
+  RSS, file size and mtime unchanged.
+
+### Tests
+
+- `node tests/run.mjs` runs everything (11 files). New spec tests were written
+  before the code and proven red. Three legacy tests now load the source through
+  the jiti harness instead of `npx tsc` in a temp dir (no network, no Node types
+  needed); two of them pin the new placeholder bytes, with CM-ADR-001 as reason.
+
 ## [1.10.1] - 2026-11-01
 
 ### Fixed — masking state after a branch change or a missed shrink

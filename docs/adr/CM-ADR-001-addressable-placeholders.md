@@ -21,7 +21,9 @@ Evidence and sources: `docs/research/2026-11-01-addressable-recall.md`.
 
 ## Decision
 
-1. Every masked placeholder carries `#<id>`: the first 10 hex characters of `sha1(toolCallId)`.
+1. Every masked placeholder carries `#<id>`: the first 10 hex characters of
+   `sha1(toolCallId + "\0" + timestamp)` (see the amendment below; the first draft used
+   `sha1(toolCallId)`).
    The length is fixed. Growing the id on a collision (ARC's method) would rewrite earlier
    placeholders and break the cache, so a collision is reported by `cm_recall` instead.
 2. New default templates (both built-in profiles):
@@ -50,6 +52,16 @@ Evidence and sources: `docs/research/2026-11-01-addressable-recall.md`.
   cost about 2.4% for a need that occurs on 0.2% of masked results.
 - `derived:` collision bound: 12,232 results in the largest measured session; with 40 bits the
   birthday estimate is n²/2⁴¹ ≈ 7e-5.
+## Amendment (2026-11-01, during the build): the timestamp is part of the id key
+
+The replay on 40 real sessions found 15 placeholders that recalled the wrong result. Kimi through
+OpenRouter reuses tool-call ids such as `bash:0` in every turn: 17 repeats on one branch. With
+`sha1(toolCallId)` those results shared one id, and recall returned the newest. The key is now
+`toolCallId + "\0" + timestamp` of the tool-result message. The context event and the session file
+carry the same timestamp. Measured on 28,279 results in 30 days: every result has a numeric
+timestamp, and no (toolCallId, timestamp) pair repeats. After the change the replay checked 29,300
+placeholders with 0 failures. The spec tests' `sid` helper changed with this amendment as its reason.
+
 - Tests that pinned the v1.9.0 bytes (`test-back-compat.mjs`, `test-profiles.mjs`) change with this
   ADR as their reason. Legacy `[masked …]` and `[cm-masked …]` placeholders without ids are still
   recognized as masked.

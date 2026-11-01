@@ -35,14 +35,40 @@ The killer feature that standalone proxies **cannot** do.
 
 Pi's `context` event fires before every LLM call with a deep copy of the conversation history. Condensed Milk retroactively masks old tool results so the model sees a short deterministic placeholder instead of the original payload.
 
-**Algorithm (v1.2.0+ static cutoff, ADR-018):** a cutoff index T advances only when context usage crosses a pressure threshold. Between advances T is immutable — bytes before T stay byte-identical turn-over-turn — cache prefix stable. Defaults: thresholds `[0.20, 0.35, 0.50]` of context used, coverage `[0.50, 0.75, 0.90]` of messages masked at each zone.
+**Algorithm (v1.2.0+ static cutoff, ADR-018):** a cutoff index T advances only when context usage crosses a pressure threshold. Between advances T is immutable — bytes before T stay byte-identical turn-over-turn — cache prefix stable. Defaults (v1.7.0): thresholds `[0.30, 0.45, 0.60]` of context used, coverage `[0.60, 0.80, 0.95]` of messages masked at each zone.
 
-**Placeholders (v1.9.0, ADR-029):**
+**Placeholders (v1.11.0, CM-ADR-001):**
 
-- `[cm-masked bash] <command truncated to 80 chars>` — for bash results
-- `[cm-masked read] <path> (N lines, SIZE)` — for read results (v1.4.0: size metadata helps the model decide whether to re-read)
+- `[cm-masked bash #3f9a2c1d7e] <command, first 80 chars> (N lines, SIZE)` — bash results
+- `[cm-masked read #3f9a2c1d7e] <path> (N lines, SIZE)` — read results
+- `[cm-masked recall #3f9a2c1d7e] <recall arguments> (N lines, SIZE)` — `cm_recall` results
 
-The `cm-` prefix brands the placeholder as a condensed-milk artifact so fresh agents (e.g. parachuted in via `context_checkout`) don't misread them as tool failures. v1.9.0 also appends a constant explainer to every turn's system prompt via `before_agent_start` so looping agents always know that `[cm-masked …]` means "re-run or re-read to get current content" — cache-stable (same bytes every turn) and amortized across the session regardless of how many items are masked. Legacy `[masked …]` placeholders in pre-v1.9.0 session files are still recognized by `/compress-stats` via back-compat prefix match.
+The `#id` is the first 10 hex characters of `sha1(toolCallId + "\0" + timestamp)`, so it never changes and the cache stays stable. The `cm-` prefix brands the placeholder as a condensed-milk artifact so fresh agents don't misread it as a tool failure. A constant explainer is appended to every turn's system prompt via `before_agent_start`: it tells the agent to call `cm_recall` with the id for the output as it was, and to re-run the command for the current state. Legacy `[masked …]` and id-less `[cm-masked …]` placeholders in older session files are still recognized as masked.
+
+### Recall: `cm_recall` (v1.11.0, CM-ADR-002)
+
+Masking hides old results; it does not delete them. pi keeps every original in the session file, and `cm_recall` reads it back:
+
+```
+cm_recall({ id: "#3f9a2c1d7e" })                  # the original, exactly as first shown
+cm_recall({ id: "3f9a2c1d7e", grep: "FAILED" })   # matching lines, with line numbers
+cm_recall({ id: "3f9a2c1d7e", offset: 200, limit: 50 })
+cm_recall({ id: "3f9a2c1d7e", raw: true })        # the text from before a condensed-milk filter
+cm_recall({ match: "git status" })                # list ids (newest first, at most 10)
+cm_recall({ session: "<session id or .jsonl path>", match: "pytest" })   # another session, read-only
+```
+
+- The header always says the output is old (`… N turns ago, not the current state.`). Results that cannot be reproduced (a `git status` before a commit, a changed web page, a slow test run) come back as they were.
+- When a filter changes a bash result, the text from before the filter goes into the result's `details`: saved in the session file, never sent to the model. The `env`/`printenv` filter hides secrets, so its raw text is never kept.
+- Output is capped at 2,000 lines and at 5% of the context window (4-50 KB); a cut output says which `offset` to use next. Another session is streamed (two passes), so 500 MB session files work (0.8 s on a 548 MB file) and are never written.
+- Why recall and not a smaller result at landing: in 2026 studies, deleting or shrinking tool output raised billed cost on cached APIs, and reversible removal with a stable address is the design ARC, ReFold, LCM and Agent-Controlled Forgetting converge on. See `docs/research/2026-11-01-addressable-recall.md`.
+
+### Triggers: task boundary and idle (v1.11.0, CM-ADR-002)
+
+Besides the pressure zones, two events move the cutoff. Each applies only when it frees at least 32 KB, and each costs one cache rewrite, like a zone advance.
+
+- **Task boundary.** `/cm-boundary`, a `pi.events.emit("condensed-milk:boundary", {})` from another extension (an orchestrator), or a bash command that matches `boundaryCommands` in the rules config (for example `"^bd close\\b"`). At the next model call every result the model has seen is masked; results after the newest assistant message stay.
+- **Idle.** When the time since the last cache touch (the last assistant message or a pi `cache_warm` refresh) is longer than the prompt-cache lifetime, the next call rewrites the cache anyway, so the cutoff enters the next zone then. Lifetime: `cacheTtlSeconds` in `~/.config/condensed-milk.json`, else the model's `promptCache` (`PI_CACHE_RETENTION=long` uses the long tier). Unknown lifetime turns it off.
 
 **Reference files are never masked.** v1.6.0 protects by basename set (`AGENTS.md`, `CONVENTIONS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `README.md`, `CHANGELOG.md`, `package.json`, `tsconfig.json`, `pyproject.toml`, `biome.json`, etc.) *and* by path substrings (`/knowledge/decisions/`, `/knowledge/concepts/`, `/knowledge/patterns/`, `/.pi/agent/skills/`, `/.pi/skills/`, `/rules/`). Add your own via config — see [Configuration](#configuration).
 
@@ -128,6 +154,10 @@ The extension works automatically — no configuration needed. Every bash comman
 | `/compress-stats` | Show compression + masking statistics for the current session, including re-read telemetry (v1.4.0) |
 | `/compress-config` | Show or update thresholds/coverage/statusbar (`thresholds 0.15,0.30,0.45`, `coverage 0.5,0.75,0.9`, `status on\|off`) |
 | `/compress-profile` | Show or switch the active backend profile (v1.10.0). `/compress-profile qwen-vllm` switches; takes effect on next session. |
+| `/compress-telemetry` | Opt-in local session telemetry (schema 2 since v1.11.0: recall and trigger counters). |
+| `/cm-boundary` | v1.11.0: mark the end of a task; the next model call masks every result the model has seen (if that frees at least 32 KB). |
+
+The extension also registers one tool for the model: `cm_recall` (see [Recall](#recall-cm_recall-v1110-cm-adr-002)).
 
 ### Status Bar
 
@@ -145,7 +175,8 @@ Controls when and how aggressively masking fires. Single source of truth for cac
 {
   "thresholds": [0.30, 0.45, 0.60],
   "coverage":   [0.60, 0.80, 0.95],
-  "showStatus": true
+  "showStatus": true,
+  "cacheTtlSeconds": 3600
 }
 ```
 
@@ -156,6 +187,7 @@ v1.8.0 auto-migrates configs matching any recognized prior default tuple (e.g. v
 | `thresholds` | Context-usage fractions (0..1) that trigger cutoff advancement. Monotonically increasing. |
 | `coverage` | Fraction of messages masked when each threshold fires. Same length as `thresholds`. |
 | `showStatus` | Publish `↓N (Cf)` token-savings indicator to the pi status bar. Default `true`. Orthogonal to compression — only controls the footer. |
+| `cacheTtlSeconds` | v1.11.0: prompt-cache lifetime for the idle trigger. Optional: by default the model's `promptCache` tier is used (`PI_CACHE_RETENTION=long` → long). |
 
 Also editable via `/compress-config`. Changes take effect on next session.
 
@@ -201,8 +233,8 @@ Define your own under `profiles`. Built-in profiles can be partially overridden 
       "coverage":   [0.50, 0.75, 0.95],
       "effectiveContextCap": 131072,
       "placeholderFormat": {
-        "bash": "<elided tool=\"bash\" cmd=\"{cmd}\"/>",
-        "read": "<elided tool=\"read\" path=\"{path}\" lines=\"{n}\" size=\"{size}\"/>"
+        "bash": "<elided tool=\"bash\" id=\"{id}\" cmd=\"{cmd}\"/>",
+        "read": "<elided tool=\"read\" id=\"{id}\" path=\"{path}\" lines=\"{n}\" size=\"{size}\"/>"
       },
       "maskOldThinking": "above-cutoff"
     }
@@ -215,8 +247,11 @@ Define your own under `profiles`. Built-in profiles can be partially overridden 
 | `label` | Human-readable name shown in `/compress-stats` |
 | `thresholds`, `coverage` | Same as legacy top-level fields, but scoped per-profile |
 | `effectiveContextCap` | Denominator for pressure math; `null` = use the model's advertised window |
-| `placeholderFormat.bash` | Template with `{cmd}`. Substituted at mask time. Must be deterministic (no timestamps). |
-| `placeholderFormat.read` | Template with `{path}`, `{n}`, `{size}` |
+| `placeholderFormat.bash` | Template with `{id}`, `{cmd}`, `{n}`, `{size}`. Substituted at mask time. Must be deterministic (no timestamps). |
+| `placeholderFormat.read` | Template with `{id}`, `{path}`, `{n}`, `{size}` |
+| `placeholderFormat.recall` | Template with `{id}`, `{cmd}` (the recall arguments), `{n}`, `{size}` |
+
+A template without `{id}` still works, but `cm_recall` cannot address what it masks (use `match`); the profile warning says so.
 | `maskOldThinking` | `"off"` \| `"with-coverage"` \| `"above-cutoff"`. Controls whether assistant `<think>` blocks before the cutoff are wiped to a deterministic empty string. |
 
 Validation is non-fatal — invalid overrides log a warning surfaced in `/compress-stats` and fall back to the base profile. Unknown profile names log a warning and use `default`.
@@ -290,7 +325,8 @@ Custom reference files and invalidation rules. Both files optional; when both ex
       "invalidated": "^cargo\\s+(check|clippy)\\b"
     }
   ],
-  "disableDefaults": false
+  "disableDefaults": false,
+  "boundaryCommands": ["^bd close\\b"]
 }
 ```
 
@@ -300,6 +336,7 @@ Custom reference files and invalidation rules. Both files optional; when both ex
 | `referencePathSubstrings` | `string[]` | Any file whose path contains one of these substrings is protected. Good for "all files under this directory". |
 | `invalidationRules` | `{invalidator, invalidated}[]` | Each rule is a pair of regex source strings (NOT compiled `/regex/` literals — plain strings). When an `invalidator` command runs later, it invalidates earlier matching `invalidated` commands in the same cwd. |
 | `disableDefaults` | `boolean` | If `true`, your arrays *replace* the built-ins instead of extending them. Default `false`. |
+| `boundaryCommands` | `string[]` | v1.11.0: regex source strings matched against the `cd`-stripped bash command. A match marks a task boundary (see [Triggers](#triggers-task-boundary-and-idle-v1110-cm-adr-002)). Empty by default. |
 
 **Regex notes:**
 

@@ -6,6 +6,12 @@ Date: 2026-11-01. Scope: condensed-milk-pi v1.10.0. Status: approved by the oper
 Correction found during the build: pi's `SessionManager.open()` migrates old session files and
 rewrites them, so recall from another session reads the `.jsonl` file directly (CM-ADR-002 §1).
 
+Two more corrections from the build: (1) the id key is `sha1(toolCallId + "\0" + timestamp)`,
+because Kimi through OpenRouter reuses call ids such as `bash:0` (CM-ADR-001 amendment); (2) a
+task boundary keeps the results after the newest assistant message, which the model has not seen
+yet (CM-ADR-002 §4). Replay on 40 sessions: 29,300 placeholders, 0 failures; size-weighted
+placeholder growth 0.041%.
+
 ## 1. The problem
 
 Condensed-milk masks old tool results with `[cm-masked bash|read] …` placeholders. The

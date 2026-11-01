@@ -30,7 +30,9 @@ to re-run. Speed-of-light sketch: "the agent asks for result #id and gets the sa
   `.jsonl` path) reads another session.
 - Source of truth: the current branch from `ctx.sessionManager.getBranch()`. There is no in-memory
   archive, so recall works after a restart, after compaction and after hibernation.
-- Another session: the `.jsonl` file is read and parsed by condensed-milk, never written. pi's
+- Another session: the `.jsonl` file is streamed and parsed by condensed-milk, never written. Session
+  files reach 522 MB, more than one JavaScript string can hold, so pass 1 keeps light metadata per line
+  and pass 2 reads only the chosen line by its byte offset. pi's
   `SessionManager.open()` migrates old files and rewrites them, so it is not used. The path must be
   inside the pi sessions directory (`$PI_CODING_AGENT_DIR/sessions`, default `~/.pi/agent/sessions`).
   The branch is the parent chain from the last entry in the file.
@@ -58,9 +60,13 @@ result `sensitive`; then `details` gets `condensedMilk: { rawWithheld: "secret" 
 
 Sources: the `pi.events` channel `condensed-milk:boundary`, the `/cm-boundary` command, and
 `boundaryCommands` (regular expressions in the rules config, matched against the `cd`-stripped bash
-command; empty by default). At the next context event the candidate cutoff is the message count.
-It applies only when it masks at least `BOUNDARY_MIN_BYTES` more than the current cutoff. The cutoff
-never moves back, and protected reference files are never masked.
+command; empty by default). At the next context event the candidate cutoff is the message count,
+minus the tool results after the newest assistant message: the model has not seen those yet, and
+masking them would be the immediate deletion that lowered solve rates (arXiv 2610.35496). This
+refinement was made during the build; the spec tests' fixtures end with the agent's closing
+message, and one check covers unseen results. The boundary applies only when it masks at least
+`BOUNDARY_MIN_BYTES` more than the current cutoff. The cutoff never moves back, and protected
+reference files are never masked.
 
 ### 5. Idle-aligned advance
 
@@ -76,14 +82,23 @@ the trigger off. At the last zone the trigger does nothing.
 | Bound | Value | Provenance |
 |---|---|---|
 | `RECALL_OUTPUT_BYTES_MAX` | 51,200 | inherited: pi `DEFAULT_MAX_BYTES` |
+| `RECALL_OUTPUT_BYTES_MIN` | 4,096 | arbitrary: one screen of output still fits a tiny window; revisit with the recall telemetry |
 | `RECALL_OUTPUT_LINES_MAX` | 2,000 | inherited: pi `DEFAULT_MAX_LINES` |
 | recall cap per call | min(51,200, 5% of the effective window × 4 bytes per token) | arbitrary: revisit if agents often recall twice |
 | `RECALL_SCAN_ENTRIES_MAX` | 65,536 | measured: longest branch 26,241 entries in 30 days |
 | `RECALL_MATCH_ROWS_MAX` | 10 | arbitrary: revisit if `match` is often followed by another `match` |
 | `RAW_KEEP_BYTES_MAX` | 51,200 | inherited: pi bash truncation caps the text first |
-| `SESSION_FILE_BYTES_MAX` | 268,435,456 | arbitrary: 10x the largest measured session file; revisit if hit |
+| `SESSION_FILE_LINES_MAX` | 262,144 | measured: the 3 largest session files (456-522 MB) have at most 28,128 lines; about 9x headroom |
 | `BOUNDARY_MIN_BYTES` | 32,768 | arbitrary: revisit with the boundary telemetry |
 | `IDLE_SCAN_ENTRIES_MAX` | 512 | arbitrary: entries walked back from the leaf to find the last cache touch |
+| `SESSION_LOOKUP_FILES_MAX` | 65,536 | arbitrary: file names listed while looking up a session id; revisit if a sessions dir holds more |
+| `LABEL_KEY_CHARS_MAX` | 512 | arbitrary: characters of a call label kept per entry, so long codemode or MCP arguments do not hold megabytes per scan |
+| `RECALL_RERUN_TRACKED_MAX` | 256 | arbitrary: recalls remembered for `recall_then_rerun`; revisit with the telemetry |
+
+At-limit actions: a cut output ends with a footer that names the next `offset` (a first line longer
+than the cap is cut inside the line, and the footer says so). A scan that hits a bound returns an
+error that names it. Raw text over `RAW_KEEP_BYTES_MAX` is not kept, and `raw` then returns an
+error that says why.
 
 ### 7. Telemetry (opt-in, local, as today)
 

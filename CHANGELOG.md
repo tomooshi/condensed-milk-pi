@@ -2,6 +2,29 @@
 
 All notable changes to condensed-milk.
 
+## [1.11.1] - 2026-11-01
+
+### Fixed — test runs with failures were reported as passing ([issue #4](https://github.com/tomooshi/condensed-milk-pi/issues/4))
+
+- The test-runner filter (jest, vitest, mocha, npm/pnpm/yarn/bun test, cargo test) took the
+  first "N passed" in the output, often the test-FILE count, and missed "failed" in jest, cargo
+  and bun order. A run with 3 failed and 39 passed showed as `Test Results: 1 passed` or
+  `39 passed`, with every failure dropped. This shipped in every earlier version.
+- New rule (CM-ADR-003): only a fully passing run is summarized. A nonzero exit, any failure sign
+  (including TAP `not ok` and node:test `✖`), or counts that cannot be read leave the output
+  unchanged. Counts come from the runner's test summary; the guessing fallback is gone.
+- Measured on 2,758 real test-runner outputs (90 days): the old filter would summarize 815 and
+  hide a failure in 338 of them; the new filter summarizes 416 passing runs (435 KB saved) and
+  hides none.
+
+### Added
+
+- `disabledFilters` in the rules config: turn off chosen filters by name, for example
+  `["yarn test", "*json"]`. Unknown names show in `/compress-stats`. Requested in issue #4.
+- Filters receive `isError` (nonzero exit), so they can refuse to summarize a failed run.
+
+1.11.0 was released on GitHub only; npm goes from 1.9.0 to 1.11.1, which contains all of 1.11.0.
+
 ## [1.11.0] - 2026-11-01
 
 **Help tune the defaults:** if you turn on local telemetry, please share the anonymized

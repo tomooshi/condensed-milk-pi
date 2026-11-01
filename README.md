@@ -15,6 +15,7 @@ Intercepts bash command output before the model sees it and applies semantic com
 | Command | Before | After | Savings |
 |---------|--------|-------|---------|
 | `python -m pytest` | 50+ lines of progress dots, headers, timing | `pytest: 125 passed, 15 skipped in 5.6s` | ~95% |
+| `vitest` / `jest` / `mocha` / `bun test` / `cargo test` / `go test` (all passing) | Per-test lines, timing, file lists | `Test Results: 42 passed` | ~95% |
 | `git status` | Branch info, staging area, working tree | `on main: 3 staged, 2 modified [file1, file2]` | ~75% |
 | `git diff` (large) | Full patch with metadata headers | Changed lines only, context collapsed | ~70% |
 | `git log` (verbose) | Author/Date/body per commit | `hash subject` per commit | ~80% |
@@ -28,6 +29,8 @@ Intercepts bash command output before the model sees it and applies semantic com
 | `tsc` | Verbose TS errors | Grouped by file, 3 samples each | ~60% |
 | Log output | Repeated lines with timestamps | Collapsed to `line [xN]` | Variable |
 | JSON output (>1KB) | Full values, deeply nested | Keys + types + array lengths | ~80% |
+
+**A filter never hides a failure (v1.11.1, CM-ADR-003).** Test runners are summarized only when every test passed. A nonzero exit, any failure sign, or a summary the filter cannot read leaves the output unchanged, so the agent sees the failures. To turn off any filter, list it in `disabledFilters` (see [Rules](#3-rules--piagentcondensed-milk-configjson-global--condensed-milkconfigjson-project-local)).
 
 **Log dedup normalization** (from RTK): UUIDs, hex addresses, and large numbers are normalized before dedup matching, so lines differing only in request IDs or memory addresses collapse together.
 
@@ -339,7 +342,8 @@ Custom reference files and invalidation rules. Both files optional; when both ex
     }
   ],
   "disableDefaults": false,
-  "boundaryCommands": ["^bd close\\b"]
+  "boundaryCommands": ["^bd close\\b"],
+  "disabledFilters": ["yarn test", "*json"]
 }
 ```
 
@@ -349,6 +353,7 @@ Custom reference files and invalidation rules. Both files optional; when both ex
 | `referencePathSubstrings` | `string[]` | Any file whose path contains one of these substrings is protected. Good for "all files under this directory". |
 | `invalidationRules` | `{invalidator, invalidated}[]` | Each rule is a pair of regex source strings (NOT compiled `/regex/` literals — plain strings). When an `invalidator` command runs later, it invalidates earlier matching `invalidated` commands in the same cwd. |
 | `disableDefaults` | `boolean` | If `true`, your arrays *replace* the built-ins instead of extending them. Default `false`. |
+| `disabledFilters` | `string[]` | v1.11.1: filters to turn off, by registered name: a command prefix such as `"yarn test"` or `"git diff"`, or `"*json"` for the JSON content fallback. The full list is in `/compress-stats` (Filters). Disabling `env`/`printenv` lets secret values reach the model. |
 | `boundaryCommands` | `string[]` | v1.11.0: regex source strings matched against the `cd`-stripped bash command. A match marks a task boundary (see [Triggers](#triggers-task-boundary-and-idle-v1110-cm-adr-002)). Empty by default. |
 
 **Regex notes:**

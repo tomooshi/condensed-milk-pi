@@ -96,7 +96,7 @@ const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
 // Path is separate from CONFIG_PATH so deleting one doesn't disturb the other.
 const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.jsonl");
 const TELEMETRY_SCHEMA_VERSION = 1;
-const PACKAGE_VERSION = "1.10.0";
+const PACKAGE_VERSION = "1.10.1";
 
 /** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
  *  extension (e.g. user-installed third-party tools with identifying names)
@@ -402,7 +402,13 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   // v1.9.0 (ADR-029) renamed the prefix from `[masked …]` to `[cm-masked …]`).
   // Reset all position-based state and re-enter zones naturally on next
   // context event that crosses a threshold.
-  pi.on("session_compact", async (_event, _ctx) => {
+  // v1.10.1: branch navigation (session_tree; pi-context's context_compact
+  // branches from an earlier node) shrinks messages exactly like compaction,
+  // so it needs the same reset. Same function, three triggers.
+  pi.on("session_compact", async (_event, _ctx) => resetPositionState());
+  pi.on("session_tree", async (_event, _ctx) => resetPositionState());
+
+  function resetPositionState(): void {
     persistentCutoff = 0;
     zoneEntered = -1;
     // Clear mask trackers: placeholders in compact summary aren't tracked by
@@ -422,7 +428,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     contextSaved = 0;
     contextMaskEvents = 0;
     contextMasksTotal = 0;
-  });
+  }
 
   // v1.8.0: on shutdown, if opt-in, append one JSONL line. Never writes without
   // explicit opt-in. Runs on graceful shutdown only (Ctrl+C/D, SIGHUP, SIGTERM);
@@ -623,6 +629,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     // v1.2.1 true-static cutoff: cutoff freezes at zone entry and does
     // NOT re-derive from messages.length on subsequent turns. Eliminates
     // the drift-write pattern observed in v1.2.0 at zone 2.
+    // v1.10.1: a persisted cutoff beyond the array means the history shrank
+    // under us (compaction or branch we got no event for). The v1.8.1 clamp
+    // min(cutoff, length) turned that into "mask everything" every turn;
+    // the correct response is the compaction reset.
+    if (persistentCutoff > event.messages.length) resetPositionState();
+
     const decision = decideCutoff(event.messages.length, {
       thresholds: config.thresholds,
       coverage: config.coverage,

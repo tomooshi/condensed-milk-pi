@@ -2,6 +2,25 @@
 
 All notable changes to condensed-milk.
 
+## [1.10.1] - 2026-11-01
+
+### Fixed — masking state after a branch change or a missed shrink
+
+- `session_tree` (branch navigation, including pi-context's
+  `context_compact`, which branches from an earlier node) now resets the
+  cutoff and zone exactly like `session_compact`. Before, the frozen cutoff
+  from the old branch stayed, so results on the new branch were masked at
+  the wrong index.
+- A persisted cutoff larger than the current message count now resets the
+  masking state. The v1.8.1 clamp `min(cutoff, length)` turned that case
+  into "mask every tool result" on every turn.
+- Regression test: `tests/reset-on-branch.test.mjs` (red on 1.10.0: it
+  masked all 4 results of an 8-message history; green on 1.10.1). It is the
+  first test that drives the real `index.ts` handlers through a fake pi
+  (`tests/harness.mjs`, which loads the TypeScript through pi's bundled jiti).
+
+Not published to npm on its own; it ships with 1.11.0.
+
 ## [1.10.0] - 2026-04-30
 
 ### Added — backend profiles (Phase 1 of vLLM/Qwen support)

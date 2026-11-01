@@ -113,7 +113,7 @@ const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
 const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.jsonl");
 // v1.11.0: schema 2 adds recall and trigger counters (CM-ADR-002 §7).
 const TELEMETRY_SCHEMA_VERSION = 2;
-const PACKAGE_VERSION = "1.11.0";
+const PACKAGE_VERSION = "1.11.1";
 
 /** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
  *  extension (e.g. user-installed third-party tools with identifying names)

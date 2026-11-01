@@ -278,6 +278,7 @@ function loadUserRulesConfig(): UserConfig {
     if (Array.isArray(c.invalidationRules)) cfg.invalidationRules.push(...c.invalidationRules);
     if (c.disableDefaults === true) cfg.disableDefaults = true;
     if (Array.isArray(c.boundaryCommands)) cfg.boundaryCommands.push(...c.boundaryCommands);
+    if (Array.isArray(c.disabledFilters)) cfg.disabledFilters.push(...c.disabledFilters);
   }
   return cfg;
 }
@@ -673,7 +674,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
 
     const stdout = stripAnsi(originalText);  // zero information loss
     totalCommands++;
-    const result = dispatch(command, stdout);
+    // v1.11.1 (CM-ADR-003): isError lets filters refuse to summarize a failed run.
+    const result = dispatch(command, stdout, { disabled: USER_RULES.disabledFilters, isError: event.isError === true });
     const finalOutput = result ? result.output : stdout;
     const saved = originalText.length - finalOutput.length;
     if (saved <= 0) return undefined;
@@ -947,6 +949,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           ? ["  Profile warnings:", ...profileWarnings.map((w) => `    • ${w}`)]
           : []),
         `  Filters: ${cmds.join(", ")}`,
+        ...(USER_RULES.disabledFilters.size > 0 ? [`  Disabled filters: ${[...USER_RULES.disabledFilters].join(", ")}`] : []),
+        ...(unknownDisabledFilters().length > 0 ? [`  Unknown names in disabledFilters (no effect): ${unknownDisabledFilters().join(", ")}`] : []),
         `  Commands processed: ${totalCommands}`,
         `  Commands compressed: ${compressedCount}`,
         `  Original: ${formatBytes(totalOriginal)}`,
@@ -1399,6 +1403,13 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       );
     },
   });
+}
+
+/** Names in disabledFilters that match no registered filter, so a typo is
+ *  visible in /compress-stats instead of silently doing nothing. */
+function unknownDisabledFilters(): string[] {
+  const known = new Set(registeredCommands());
+  return [...USER_RULES.disabledFilters].filter((name) => !known.has(name));
 }
 
 /** What a filtered bash result keeps in details.condensedMilk (CM-ADR-002 §2):

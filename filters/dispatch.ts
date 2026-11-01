@@ -14,7 +14,21 @@ export interface FilterResult {
   sensitive?: boolean;
 }
 
-export type FilterFn = (input: string, command: string) => FilterResult | null;
+/** v1.11.1 (CM-ADR-003): facts about the run that the output text alone
+ *  does not show. `isError` is true when the command exited nonzero. */
+export interface FilterMeta {
+  isError: boolean;
+}
+
+export type FilterFn = (input: string, command: string, meta: FilterMeta) => FilterResult | null;
+
+/** v1.11.1 (CM-ADR-003, issue #4): per-call options. `disabled` holds
+ *  registered filter names to skip: a command prefix as passed to
+ *  registerFilter() ("yarn test"), or "*<name>" for a content fallback ("*json"). */
+export interface DispatchOptions {
+  disabled?: ReadonlySet<string>;
+  isError?: boolean;
+}
 
 interface FilterSpec {
   /** Command prefix to match (e.g., "git status", "pytest") */
@@ -66,9 +80,12 @@ function isSilentSegment(seg: string): boolean {
   return SILENT_COMMANDS.has(firstWord(seg));
 }
 
-export function dispatch(command: string, stdout: string): FilterResult | null {
+export function dispatch(command: string, stdout: string, options: DispatchOptions = {}): FilterResult | null {
   // Skip tiny outputs — compression overhead exceeds savings
   if (stdout.length < 80) return null;
+  const disabled = options.disabled ?? NO_DISABLED;
+  const meta: FilterMeta = { isError: options.isError === true };
+  const fallbacks = contentFallbacks.filter((fb) => !disabled.has(`*${fb.name}`));
 
   // Split compound commands and try each segment
   const segments = splitCompoundCommand(command);
@@ -82,13 +99,7 @@ export function dispatch(command: string, stdout: string): FilterResult | null {
   const nonSilentSegments = segments.filter(
     (s) => s.trim().length > 0 && !isSilentSegment(s),
   );
-  if (nonSilentSegments.length >= 2) {
-    for (const fb of contentFallbacks) {
-      const result = fb.filter(stdout, command);
-      if (result && result.output.length < stdout.length) return result;
-    }
-    return null;
-  }
+  if (nonSilentSegments.length >= 2) return runFallbacks(fallbacks, stdout, command, meta);
 
   // Try segments in reverse — last command in chain produced the output
   for (let i = segments.length - 1; i >= 0; i--) {
@@ -101,7 +112,9 @@ export function dispatch(command: string, stdout: string): FilterResult | null {
 
     for (const spec of specs) {
       if (commandMatches(cleaned, spec.command)) {
-        const result = spec.filter(stdout, cleaned);
+        // A disabled filter counts as "matched but declined" (issue #4).
+        if (disabled.has(spec.command)) break;
+        const result = spec.filter(stdout, cleaned, meta);
         if (result && result.output.length < stdout.length) {
           return result;
         }
@@ -111,11 +124,20 @@ export function dispatch(command: string, stdout: string): FilterResult | null {
   }
 
   // No command-prefix match — try content-based fallbacks
-  for (const fb of contentFallbacks) {
-    const result = fb.filter(stdout, command);
+  return runFallbacks(fallbacks, stdout, command, meta);
+}
+
+/** First content fallback that makes the output shorter, or null. */
+function runFallbacks(
+  fallbacks: readonly { name: string; filter: FilterFn }[],
+  stdout: string,
+  command: string,
+  meta: FilterMeta,
+): FilterResult | null {
+  for (const fb of fallbacks) {
+    const result = fb.filter(stdout, command, meta);
     if (result && result.output.length < stdout.length) return result;
   }
-
   return null;
 }
 
@@ -150,6 +172,8 @@ function commandMatches(command: string, spec: string): boolean {
   if (!command.startsWith(spec)) return false;
   return command.length === spec.length || command[spec.length] === " " || command[spec.length] === "\t";
 }
+
+const NO_DISABLED: ReadonlySet<string> = new Set();
 
 // Content-based fallback filters (not command-prefix based)
 let contentFallbacks: Array<{ name: string; filter: FilterFn }> = [];

@@ -140,10 +140,13 @@ export interface UserConfig {
   /** v1.11.0 (CM-ADR-002 §4): regexes matched against the cd-stripped bash
    *  command; a match marks a task boundary. Empty by default. */
   boundaryCommands: string[];
+  /** v1.11.1 (CM-ADR-003, issue #4): filter names to turn off: a command
+   *  prefix as registered ("yarn test") or "*<name>" for a content fallback. */
+  disabledFilters: string[];
 }
 
 export function emptyUserConfig(): UserConfig {
-  return { referenceBasenames: [], referencePathSubstrings: [], invalidationRules: [], disableDefaults: false, boundaryCommands: [] };
+  return { referenceBasenames: [], referencePathSubstrings: [], invalidationRules: [], disableDefaults: false, boundaryCommands: [], disabledFilters: [] };
 }
 
 export interface ResolvedRules {
@@ -151,6 +154,7 @@ export interface ResolvedRules {
   substrings: readonly string[];
   invalidationRules: readonly { invalidator: RegExp; invalidated: RegExp }[];
   boundaryCommands: readonly RegExp[];
+  disabledFilters: ReadonlySet<string>;
 }
 
 /** Pure transform UserConfig → ResolvedRules. Compiles user regex
@@ -170,7 +174,8 @@ export function resolveRules(user: UserConfig): ResolvedRules {
     ? userRules
     : [...DEFAULT_INVALIDATION_RULES, ...userRules];
   const boundaryCommands = (user.boundaryCommands ?? []).map((pattern) => new RegExp(pattern));
-  return { basenames: new Set(baseNames), substrings: subs, invalidationRules: rules, boundaryCommands };
+  const disabledFilters = new Set((user.disabledFilters ?? []).map((name) => String(name).trim()).filter(Boolean));
+  return { basenames: new Set(baseNames), substrings: subs, invalidationRules: rules, boundaryCommands, disabledFilters };
 }
 
 /** True when the bash command, with its `cd X &&` prefixes removed, matches

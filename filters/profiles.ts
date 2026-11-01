@@ -24,23 +24,32 @@
  *                     where old reasoning is highest-value to drop */
 export type ThinkingMaskPolicy = "off" | "with-coverage" | "above-cutoff";
 
-/** Placeholder template strings. `{cmd}`, `{path}`, `{n}`, `{size}` are
- *  substituted at mask time. Templates MUST be deterministic — no
- *  timestamps, no random IDs — or cache prefix stability is broken.
- *  Tokens are kept short to minimize prefill cost when the model decides
- *  to skim a long masked region.
+/** Placeholder template strings. `{id}`, `{cmd}`, `{path}`, `{n}`, `{size}`
+ *  are substituted at mask time. Templates MUST be deterministic — no
+ *  timestamps, no random values — or cache prefix stability is broken.
+ *  `{id}` is the short id of the tool call (sha1, fixed length), so it is
+ *  deterministic too.
  *
- *  Anthropic-side default keeps the existing v1.9.0 `[cm-masked …]`
- *  format that downstream pi tooling already recognizes (e.g. session
- *  replay tools). Switching format on existing Anthropic sessions would
- *  invalidate previously-cached prefixes — the format change is opt-in
- *  per-profile precisely so that doesn't happen by accident. */
+ *  v1.11.0 (CM-ADR-001): every built-in template carries `#{id}` so that
+ *  `cm_recall` can return the original. This changed the bytes once, a
+ *  deliberate cache bust recorded in the ADR. A custom template without
+ *  `{id}` still works; resolveProfile warns that its results cannot be
+ *  recalled by id. */
 export interface PlaceholderTemplates {
-  /** Substituted: {cmd} = first 80 chars of the bash command. */
+  /** Substituted: {id}, {cmd} = first 80 chars of the bash command, {n}, {size}. */
   bash: string;
-  /** Substituted: {path}, {n} (line count), {size} (formatted bytes). */
+  /** Substituted: {id}, {path}, {n} (line count), {size} (formatted size). */
   read: string;
+  /** Substituted: {id}, {cmd} = the recall label (`id=… grep="…"`), {n}, {size}. */
+  recall: string;
 }
+
+/** CM-ADR-001 default templates, shared by both built-in profiles. */
+export const DEFAULT_PLACEHOLDERS: PlaceholderTemplates = {
+  bash: "[cm-masked bash #{id}] {cmd} ({n} lines, {size})",
+  read: "[cm-masked read #{id}] {path} ({n} lines, {size})",
+  recall: "[cm-masked recall #{id}] {cmd} ({n} lines, {size})",
+};
 
 /** Profile shape — every backend-specific knob in one place. */
 export interface Profile {
@@ -62,17 +71,14 @@ export interface Profile {
   maskOldThinking: ThinkingMaskPolicy;
 }
 
-/** Default profile — Anthropic-tuned. Identical to v1.9.0 behavior so
- *  upgrading users see zero behavior change. */
+/** Default profile — Anthropic-tuned. Thresholds and coverage as in
+ *  v1.9.0; placeholders carry ids since v1.11.0 (CM-ADR-001). */
 const DEFAULT_PROFILE: Profile = {
   label: "default (Anthropic-tuned)",
   thresholds: [0.30, 0.45, 0.60],
   coverage: [0.60, 0.80, 0.95],
   effectiveContextCap: null,
-  placeholderFormat: {
-    bash: "[cm-masked bash] {cmd}",
-    read: "[cm-masked read] {path} ({n} lines, {size})",
-  },
+  placeholderFormat: DEFAULT_PLACEHOLDERS,
   maskOldThinking: "off",
 };
 
@@ -89,10 +95,10 @@ const DEFAULT_PROFILE: Profile = {
  *  aggressively enough to keep the working set inside the proven
  *  long-context regime.
  *
- *  Placeholder format kept as default `[cm-masked …]` so users opting
- *  into this profile don't get a prefix-format change as a side effect
- *  of switching profiles. The XML self-closing form is documented as a
- *  custom-profile recipe (see README) for users who want to A/B it.
+ *  Placeholder format is the same as the default profile, so users
+ *  switching profiles don't get a prefix-format change as a side effect.
+ *  The XML self-closing form is documented as a custom-profile recipe
+ *  (see README) for users who want to A/B it.
  *
  *  maskOldThinking = "with-coverage": Qwen3.6 ships with
  *  `preserve_thinking` on, so historical `<think>` blocks accumulate in
@@ -104,10 +110,7 @@ const QWEN_VLLM_PROFILE: Profile = {
   thresholds: [0.20, 0.35, 0.55],
   coverage: [0.50, 0.75, 0.92],
   effectiveContextCap: 131072,
-  placeholderFormat: {
-    bash: "[cm-masked bash] {cmd}",
-    read: "[cm-masked read] {path} ({n} lines, {size})",
-  },
+  placeholderFormat: DEFAULT_PLACEHOLDERS,
   maskOldThinking: "with-coverage",
 };
 
@@ -229,7 +232,14 @@ function applyOverride(
     out.placeholderFormat = {
       bash: override.placeholderFormat.bash ?? base.placeholderFormat.bash,
       read: override.placeholderFormat.read ?? base.placeholderFormat.read,
+      recall: override.placeholderFormat.recall ?? base.placeholderFormat.recall,
     };
+    // CM-ADR-001 §5: a template without {id} still works, but cm_recall
+    // cannot address what it masks, so say so where the user looks.
+    const kinds = Object.keys(out.placeholderFormat) as (keyof PlaceholderTemplates)[];
+    const missing = kinds.filter((kind) => !out.placeholderFormat[kind].includes("{id}"));
+    warnings.push(...missing.map((kind) =>
+      `${ctx}.placeholderFormat.${kind} has no {id}; cm_recall cannot find results masked with it by id (use match)`));
   }
 
   if (override.maskOldThinking !== undefined) {
@@ -268,11 +278,13 @@ function validateMonotonic(arr: readonly number[] | undefined, ctx: string, warn
  *  uses a token we don't substitute (e.g. `{stderr}`) just shows literally. */
 export function renderPlaceholder(
   template: string,
-  vars: { cmd?: string; path?: string; n?: number; size?: string },
+  vars: { id?: string; cmd?: string; path?: string; n?: number; size?: string },
 ): string {
+  // Function replacers: a `$&` or `$1` inside a command or path must stay literal.
   return template
-    .replace(/\{cmd\}/g, vars.cmd ?? "")
-    .replace(/\{path\}/g, vars.path ?? "")
-    .replace(/\{n\}/g, vars.n !== undefined ? String(vars.n) : "")
-    .replace(/\{size\}/g, vars.size ?? "");
+    .replace(/\{id\}/g, () => vars.id ?? "")
+    .replace(/\{cmd\}/g, () => vars.cmd ?? "")
+    .replace(/\{path\}/g, () => vars.path ?? "")
+    .replace(/\{n\}/g, () => (vars.n !== undefined ? String(vars.n) : ""))
+    .replace(/\{size\}/g, () => vars.size ?? "");
 }

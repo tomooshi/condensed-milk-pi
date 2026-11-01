@@ -13,7 +13,8 @@ import { loadTs, makeRunner, assistantCall, toolResult, userMsg, entriesFor, prn
 const { check, done } = makeRunner("CM-ADR-002 recall core");
 const R = await loadTs("filters/recall.ts");
 const cc = await loadTs("filters/context-compress.ts");
-const sid = (s) => createHash("sha1").update(s).digest("hex").slice(0, 10);
+// CM-ADR-001 amendment: the id key is toolCallId + "\0" + timestamp; the builders use timestamp 0.
+const sid = (s, ts = 0) => createHash("sha1").update(`${s}\u0000${ts}`).digest("hex").slice(0, 10);
 
 const OUT = Array.from({ length: 30 }, (_, i) => `row ${i + 1}${i === 4 ? " ERROR here" : ""}`).join("\n");
 const SIZE = cc.formatSize(OUT.length);
@@ -41,7 +42,7 @@ const h1 = (id, tool, label, turns, kind = "original output as first shown") =>
 	`[cm-recall #${id}] ${tool}: ${label} — ${kind}, ${turns} turns ago, not the current state.`;
 
 // ids
-check("shortId is sha1 hex, first 10", R.shortId("c1"), sid("c1"));
+check("shortId is sha1 hex, first 10", R.shortId("c1", 0), sid("c1"));
 check("parseRecallId accepts # and upper case", R.parseRecallId("#ABCDEF0123"), "abcdef0123");
 check("parseRecallId rejects a short id", R.parseRecallId("abc"), null);
 check("records are newest first", scan.records.map((r) => r.toolCallId), ["r0", "c2", "c1", "c0"]);
@@ -54,6 +55,22 @@ check("turns ago counts later assistant messages", scan.records.map((r) => r.tur
 	check("id: exact text", r.text, `${h1(sid("c1"), "bash", "git status", 3)}\nLines 1-30 of 30 (${SIZE}).\n\n${OUT}`);
 	check("id with #: same text", recall({ id: `#${sid("c1")}` }).text, r.text);
 	check("read result label is the path", recall({ id: sid("r0") }).text.split("\n")[0], h1(sid("r0"), "read", "/a/b.ts", 1));
+}
+// a provider that reuses call ids in every turn (Kimi via OpenRouter: "bash:0")
+{
+	const reused = [
+		userMsg("go"),
+		assistantCall("bash:0", "bash", { command: "date" }), toolResult("bash:0", "bash", "first output", { timestamp: 1_000 }),
+		assistantCall("bash:0", "bash", { command: "uptime" }), toolResult("bash:0", "bash", "second output", { timestamp: 2_000 }),
+	];
+	const ents = entriesFor(reused);
+	const s = R.buildRecords(ents.map(R.lightEntry), R.RECALL_SCAN_ENTRIES_MAX);
+	check("reused call ids get distinct ids", s.records.map((r) => r.id), [sid("bash:0", 2_000), sid("bash:0", 1_000)]);
+	const older = R.planRecall(s.records, { id: sid("bash:0", 1_000) }, s);
+	check("the older result is found by its own id", older.record?.entryId, "e2");
+	const masked = cc.compressStaleToolResults([...reused, userMsg("n")].map((m) => ({ ...m, content: m.role === "toolResult" ? [{ type: "text", text: "x".repeat(200) }] : m.content })),
+		{ previousCutoff: 6, zoneEntered: 2, contextUsage: 0.9 }).messages;
+	check("placeholders use the same ids", [masked[2], masked[4]].map((m) => /#([0-9a-f]{10})\]/.exec(m.content[0].text)[1]), [sid("bash:0", 1_000), sid("bash:0", 2_000)]);
 }
 // window and grep
 {

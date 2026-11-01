@@ -9,6 +9,9 @@
 export interface FilterResult {
   output: string;
   category: "fast" | "medium" | "slow" | "immutable" | "mutation";
+  /** v1.11.0 (CM-ADR-002 §2): the filter hides secrets, so the text from
+   *  before the filter must never be kept (not even in the session file). */
+  sensitive?: boolean;
 }
 
 export type FilterFn = (input: string, command: string) => FilterResult | null;
@@ -156,7 +159,9 @@ let contentFallbacks: Array<{ name: string; filter: FilterFn }> = [];
  * command-prefix filter matches. Used for JSON detection, etc.
  */
 export function registerContentFallback(name: string, filter: FilterFn): void {
-  contentFallbacks.push({ name, filter });
+  // Replace by name: the extension registers on every load, and a push would
+  // grow the list by one entry per session start.
+  contentFallbacks = [...contentFallbacks.filter((f) => f.name !== name), { name, filter }];
 }
 
 /** List registered filter commands (for debugging/stats). */

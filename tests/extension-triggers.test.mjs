@@ -13,7 +13,8 @@ const home = isolateHome();
 mkdirSync(join(home, ".pi", "agent"), { recursive: true });
 writeFileSync(join(home, ".pi", "agent", "condensed-milk-config.json"), JSON.stringify({ boundaryCommands: ["^bd close\\b"] }));
 const ext = (await loadTs("index.ts")).default;
-const sid = (s) => createHash("sha1").update(s).digest("hex").slice(0, 10);
+// CM-ADR-001 amendment: the id key is toolCallId + "\0" + timestamp; the builders use timestamp 0.
+const sid = (s, ts = 0) => createHash("sha1").update(`${s}\u0000${ts}`).digest("hex").slice(0, 10);
 
 /** [user, (call, result) x pairs]; results of `size` chars; assistant timestamps `ts`. */
 function history(pairs, size, ts = 0) {
@@ -24,6 +25,8 @@ function history(pairs, size, ts = 0) {
 	}
 	return out;
 }
+/** The history plus the agent's closing message: every result has been seen. */
+const closed = (h) => [...h, { role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 0 }];
 const masked = (ms) => ms.map((m, i) => (m.role === "toolResult" && textOf(m).startsWith("[cm-masked") ? i : -1)).filter((i) => i >= 0);
 async function fresh() {
 	const f = makeFakePi();
@@ -39,12 +42,21 @@ async function pass(fire, messages, ctxOpts = {}) {
 // boundary from pi.events
 {
 	const { pi, fire } = await fresh();
-	const h = history(10, 5_000);
+	const h = closed(history(10, 5_000));
 	check("no masks below the zones", await pass(fire, h), []);
 	pi.events.emit("condensed-milk:boundary", { reason: "task done" });
 	check("an event boundary masks every result", (await pass(fire, h)).length, 10);
 	const h2 = [...h, assistantCall("n1", "bash", { command: "echo new" }), toolResult("n1", "bash", "n".repeat(5_000))];
 	check("results after the boundary stay", (await pass(fire, h2)).length, 10);
+}
+// results the model has not seen yet stay (no immediate deletion, arXiv 2610.35496)
+{
+	const { pi, fire } = await fresh();
+	const h = history(10, 5_000);
+	pi.events.emit("condensed-milk:boundary", {});
+	const unseen = await pass(fire, h);
+	check("a boundary keeps results after the newest assistant message", unseen.includes(h.length - 1), false);
+	check("a boundary masks the results before it", unseen.length, 9);
 }
 // byte floor
 {
@@ -57,13 +69,13 @@ async function pass(fire, messages, ctxOpts = {}) {
 {
 	const { commands, fire } = await fresh();
 	await commands.get("cm-boundary").handler("", makeCtx());
-	check("the /cm-boundary command masks every result", (await pass(fire, history(10, 5_000))).length, 10);
+	check("the /cm-boundary command masks every result", (await pass(fire, closed(history(10, 5_000)))).length, 10);
 }
 // configured bash pattern
 {
 	const { fire } = await fresh();
 	await fire("tool_result", { toolName: "bash", toolCallId: "b1", input: { command: "cd /repo && bd close abc-1" }, content: [{ type: "text", text: "✓ Closed abc-1" }], isError: false }, makeCtx());
-	check("a boundaryCommands match masks every result", (await pass(fire, history(10, 5_000))).length, 10);
+	check("a boundaryCommands match masks every result", (await pass(fire, closed(history(10, 5_000)))).length, 10);
 }
 // idle-aligned advance
 {

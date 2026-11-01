@@ -14,7 +14,8 @@ import { loadTs, makeRunner, assistantCall, toolResult, userMsg, textOf, prng, s
 const { check, done } = makeRunner("CM-ADR-001 addressable placeholders");
 const cc = await loadTs("filters/context-compress.ts");
 const profiles = await loadTs("filters/profiles.ts");
-const sid = (s) => createHash("sha1").update(s).digest("hex").slice(0, 10);
+// CM-ADR-001 amendment: the id key is toolCallId + "\0" + timestamp; the builders use timestamp 0.
+const sid = (s, ts = 0) => createHash("sha1").update(`${s}\u0000${ts}`).digest("hex").slice(0, 10);
 
 const BIG = "line\n".repeat(40) + "end"; // 41 lines, 203 chars
 const ALL_MASKED = { previousCutoff: 1_000, zoneEntered: 2, contextUsage: 0.9 };
@@ -80,7 +81,7 @@ const ALL_MASKED = { previousCutoff: 1_000, zoneEntered: 2, contextUsage: 0.9 };
 			if (JSON.stringify(m) === JSON.stringify(before)) return;
 			const text = textOf(m);
 			const ok = m.role === "toolResult" && m.role === before.role && m.toolCallId === before.toolCallId &&
-				m.toolName === before.toolName && text.startsWith("[cm-masked ") && text.includes(`#${sid(m.toolCallId)}]`);
+				m.toolName === before.toolName && text.startsWith("[cm-masked ") && text.includes(`#${sid(m.toolCallId, m.timestamp)}]`);
 			if (!ok) violations++;
 			else masked++;
 		});

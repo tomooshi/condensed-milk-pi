@@ -15,35 +15,12 @@
  * Follows test-rereads.mjs pattern: compile the TS source to JS via tsc, then
  * import the compiled module at runtime.
  */
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { loadTs } from "./tests/harness.mjs";
 
-const tmp = mkdtempSync(join(tmpdir(), "cm-compact-test-"));
-const srcPath = join(tmp, "context-compress.ts");
-writeFileSync(srcPath, readFileSync("filters/context-compress.ts", "utf-8"));
-// v1.10.0: context-compress.ts now imports from ./profiles.js; copy alongside.
-writeFileSync(join(tmp, "profiles.ts"), readFileSync("filters/profiles.ts", "utf-8"));
-
-const tsc = spawnSync("npx", ["-y", "-p", "typescript@5.9", "tsc",
-  "--target", "es2022",
-  "--module", "esnext",
-  "--moduleResolution", "bundler",
-  "--skipLibCheck",
-  "--strict", "false",
-  "--noImplicitAny", "false",
-  "--outDir", tmp,
-  srcPath,
-], { encoding: "utf-8" });
-if (tsc.status !== 0) {
-  console.error("tsc failed:");
-  console.error(tsc.stdout);
-  console.error(tsc.stderr);
-  process.exit(1);
-}
-
-const mod = await import(join(tmp, "context-compress.js"));
+// v1.11.0: load the real source through pi's jiti (tests/harness.mjs). The
+// old tsc-in-a-temp-dir step had no Node types, and context-compress.ts now
+// imports node:crypto through text-metrics.ts (CM-ADR-001).
+const mod = await loadTs("filters/context-compress.ts");
 const { compressStaleToolResults, decideCutoff } = mod;
 
 let pass = 0, fail = 0;

@@ -14,7 +14,8 @@ const { check, done } = makeRunner("CM-ADR-001/002 extension: recall wiring");
 const home = isolateHome();
 const agentDir = join(home, "agent");
 process.env.PI_CODING_AGENT_DIR = agentDir;
-const sid = (s) => createHash("sha1").update(s).digest("hex").slice(0, 10);
+// CM-ADR-001 amendment: the id key is toolCallId + "\0" + timestamp; the builders use timestamp 0.
+const sid = (s, ts = 0) => createHash("sha1").update(`${s}\u0000${ts}`).digest("hex").slice(0, 10);
 const ext = (await loadTs("index.ts")).default;
 const { pi, tools, fire } = makeFakePi();
 ext(pi);

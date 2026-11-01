@@ -38,9 +38,22 @@ import {
   decideCutoff,
   resolveRules,
   emptyUserConfig,
+  isBoundaryCommand,
+  type CompressOptions,
+  type CompressResult,
   type UserConfig,
   type ResolvedRules,
 } from "./filters/context-compress.js";
+import { labelKey, RAW_KEEP_BYTES_MAX } from "./filters/recall.js";
+import {
+  BOUNDARY_MIN_BYTES,
+  IDLE_SCAN_ENTRIES_MAX,
+  cacheTtlMs,
+  decideIdleZone,
+  lastCacheTouchMs,
+  passesMinBytes,
+} from "./filters/triggers.js";
+import { createRecallTool, type RecallOutcome } from "./io/recall-tool.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 import {
   resolveProfile,
@@ -73,6 +86,9 @@ interface CompressorConfig {
    *  Orthogonal to compression behavior — only controls the footer display.
    *  Default true. Toggle via `/compress-config status on|off`. */
   showStatus: boolean;
+  /** v1.11.0 (CM-ADR-002 §5): prompt-cache lifetime in seconds for the idle
+   *  trigger. Unset = the model's promptCache tier; unknown = trigger off. */
+  cacheTtlSeconds?: number;
 }
 
 const DEFAULT_CONFIG: CompressorConfig = {
@@ -95,8 +111,9 @@ const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
 // v1.8.0: opt-in local telemetry. Never default on. See ADR-027.
 // Path is separate from CONFIG_PATH so deleting one doesn't disturb the other.
 const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.jsonl");
-const TELEMETRY_SCHEMA_VERSION = 1;
-const PACKAGE_VERSION = "1.10.1";
+// v1.11.0: schema 2 adds recall and trigger counters (CM-ADR-002 §7).
+const TELEMETRY_SCHEMA_VERSION = 2;
+const PACKAGE_VERSION = "1.11.0";
 
 /** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
  *  extension (e.g. user-installed third-party tools with identifying names)
@@ -104,6 +121,7 @@ const PACKAGE_VERSION = "1.10.1";
  *  even into local logs. Extend this list as pi ships new built-in tools. */
 const ALLOWED_TOOL_NAMES: ReadonlySet<string> = new Set([
   "bash", "read", "edit", "write", "grep", "find", "ls", "multiedit", "notebook_read", "notebook_edit",
+  "cm_recall",
 ]);
 
 interface TelemetryConfig {
@@ -186,7 +204,8 @@ function loadConfig(): CompressorConfig {
       ? parsed.coverage
       : DEFAULT_CONFIG.coverage;
     const showStatus = typeof parsed.showStatus === "boolean" ? parsed.showStatus : DEFAULT_CONFIG.showStatus;
-    const cfg: CompressorConfig = { thresholds, coverage, showStatus };
+    const cacheTtlSeconds = typeof parsed.cacheTtlSeconds === "number" && parsed.cacheTtlSeconds > 0 ? parsed.cacheTtlSeconds : undefined;
+    const cfg: CompressorConfig = { thresholds, coverage, showStatus, cacheTtlSeconds };
     // Auto-migrate stale defaults to current recommended values.
     // Preserves any non-matching config as explicit user customization.
     const staleLabel = matchesStaleDefault(cfg);
@@ -195,6 +214,7 @@ function loadConfig(): CompressorConfig {
         thresholds: [...DEFAULT_CONFIG.thresholds],
         coverage: [...DEFAULT_CONFIG.coverage],
         showStatus,
+        cacheTtlSeconds,
       };
       saveConfig(migrated);
       try {
@@ -257,6 +277,7 @@ function loadUserRulesConfig(): UserConfig {
     if (Array.isArray(c.referencePathSubstrings)) cfg.referencePathSubstrings.push(...c.referencePathSubstrings);
     if (Array.isArray(c.invalidationRules)) cfg.invalidationRules.push(...c.invalidationRules);
     if (c.disableDefaults === true) cfg.disableDefaults = true;
+    if (Array.isArray(c.boundaryCommands)) cfg.boundaryCommands.push(...c.boundaryCommands);
   }
   return cfg;
 }
@@ -272,12 +293,27 @@ const USER_RULES: ResolvedRules = resolveRules(loadUserRulesConfig());
 // deterministic turn-over-turn so chained `before_agent_start`
 // systemPrompt contributions keep the cache prefix stable. Any future
 // edit here is a deliberate cache bust and MUST be ADR'd.
-const CM_EXPLAINER = `
+// v1.11.0 (CM-ADR-001): names cm_recall and says when to recall and when
+// to re-run; agents use a recall tool only when told to (StructMemEval).
+const CM_EXPLAINER =
+  "\n\ncondensed-milk: old tool results can appear as `[cm-masked bash|read|recall #id] …`\n" +
+  "to keep the prompt cache stable. To see one exactly as it was first shown, call\n" +
+  "`cm_recall` with the id (add `grep`, or `offset`/`limit`, for part of it). To see the\n" +
+  "current state, re-run the command or re-read the file. Each costs one step, so do it\n" +
+  "only when the next step needs the content.";
 
-condensed-milk: tool results older than the current cutoff appear as
-\`[cm-masked bash|read] …\` to keep the prompt cache stable. Re-run the
-command or re-read the file to get current content. \`/compress-stats\`
-for details.`;
+/** Channel another extension (an orchestrator) emits on to mark a task boundary. */
+const BOUNDARY_EVENT = "condensed-milk:boundary";
+
+/** arbitrary: recalls remembered while waiting to see if the agent re-runs
+ *  the same command anyway (recall_then_rerun); revisit with the telemetry. */
+const RECALL_RERUN_TRACKED_MAX = 256;
+
+/** Where pi keeps session files; cm_recall({ session }) reads only inside it. */
+function piSessionsDir(): string {
+  const agentDir = process.env.PI_CODING_AGENT_DIR;
+  return agentDir ? join(agentDir, "sessions") : join(homedir(), ".pi", "agent", "sessions");
+}
 
 // --- Per-turn telemetry ---
 interface TurnCacheData {
@@ -322,7 +358,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let sessionStartReason: string = "startup";
   let sessionSessionFile: string | undefined;
   const toolCounts = new Map<string, number>();
-  const zonesEnteredLog: Array<{ zone: number; at_turn: number; at_ctx_pct: number }> = [];
+  // v1.11.0: `by` says which trigger entered the zone (pressure or idle).
+  const zonesEnteredLog: Array<{ zone: number; at_turn: number; at_ctx_pct: number; by: "pressure" | "idle" }> = [];
 
   // Cache tracking
   let cacheHistory: TurnCacheData[] = [];
@@ -361,6 +398,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     sessionSessionFile = (event as any)?.previousSessionFile;
     toolCounts.clear();
     zonesEnteredLog.length = 0;
+    resetRecallAndTriggerStats();
     // Reload telemetry config at session start so toggle via /compress-telemetry
     // in a previous session is honored without requiring full pi restart.
     telemetryConfig = loadTelemetryConfig();
@@ -479,87 +517,181 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         commands_processed: totalCommands,
         commands_compressed: compressedCount,
         bytes_freed: contextSaved,
+        // v1.11.0 schema 2 (CM-ADR-002 §7)
+        recalls_by_id: recallStats.by_id,
+        recalls_by_match: recallStats.by_match,
+        recall_errors: recallStats.errors,
+        recalls_with_grep: recallStats.with_grep,
+        recalls_with_raw: recallStats.with_raw,
+        recalls_cross_session: recallStats.cross_session,
+        recall_bytes_returned: recallStats.bytes_returned,
+        recall_turns_ago_sum: recallStats.turns_ago_sum,
+        recall_then_rerun: recallStats.then_rerun,
+        boundaries_applied: triggerStats.boundaries_applied,
+        boundaries_skipped: triggerStats.boundaries_skipped,
+        idle_advances: triggerStats.idle_advances,
+        idle_skipped: triggerStats.idle_skipped,
+        usage_read_failures: usageReadFailures,
       };
       mkdirSync(dirname(TELEMETRY_LOG_PATH), { recursive: true });
       appendFileSync(TELEMETRY_LOG_PATH, JSON.stringify(entry) + "\n");
-    } catch {
-      // Silent failure — telemetry must never crash a session shutdown.
+    } catch (e) {
+      // Telemetry must never crash a session shutdown, but a lost line is
+      // reported, not swallowed.
+      process.stderr.write(`condensed-milk: telemetry line not written to ${TELEMETRY_LOG_PATH}: ${(e as Error).message}\n`);
     }
   });
 
-  pi.on("tool_result", async (event, _ctx) => {
+  // v1.11.0 (CM-ADR-002): trigger state. A pending boundary is an intent; it
+  // survives compaction and is consumed by the next context event.
+  let boundaryPending = false;
+  let idleHandledTouchMs: number | undefined;
+  let usageReadFailures = 0;
+  const triggerStats = { boundaries_applied: 0, boundaries_skipped: 0, idle_advances: 0, idle_skipped: 0 };
+  const recallStats = {
+    by_id: 0, by_match: 0, errors: 0, with_grep: 0, with_raw: 0, cross_session: 0,
+    bytes_returned: 0, turns_ago_sum: 0, then_rerun: 0,
+  };
+  /** `bash:<command>` / `read:<path>` keys of recalled results, oldest first. */
+  const recalledKeys = new Set<string>();
+
+  function resetRecallAndTriggerStats(): void {
+    boundaryPending = false;
+    idleHandledTouchMs = undefined;
+    usageReadFailures = 0;
+    for (const key of Object.keys(triggerStats) as (keyof typeof triggerStats)[]) triggerStats[key] = 0;
+    for (const key of Object.keys(recallStats) as (keyof typeof recallStats)[]) recallStats[key] = 0;
+    recalledKeys.clear();
+  }
+
+  function onRecallOutcome(outcome: RecallOutcome): void {
+    if (!outcome.ok) {
+      recallStats.errors++;
+      return;
+    }
+    if (outcome.mode === "match") recallStats.by_match++;
+    if (outcome.mode === "id") recallStats.by_id++;
+    if (outcome.request.grep !== undefined) recallStats.with_grep++;
+    if (outcome.request.raw === true) recallStats.with_raw++;
+    if (outcome.request.session !== undefined) recallStats.cross_session++;
+    recallStats.bytes_returned += outcome.bytes;
+    const record = outcome.record;
+    if (!record) return;
+    recallStats.turns_ago_sum += record.turnsAgo;
+    if (record.toolName !== "bash" && record.toolName !== "read") return;
+    recalledKeys.add(`${record.toolName}:${labelKey(record.label)}`);
+    if (recalledKeys.size > RECALL_RERUN_TRACKED_MAX) recalledKeys.delete(recalledKeys.values().next().value as string);
+  }
+
+  /** recall_then_rerun: the agent recalled a result and then ran the same
+   *  command (or read the same path) anyway, so the recall was not enough. */
+  function noteRerunAfterRecall(toolName: "bash" | "read", label: string): void {
+    const key = `${toolName}:${labelKey(label)}`;
+    if (!recalledKeys.has(key)) return;
+    recalledKeys.delete(key);
+    recallStats.then_rerun++;
+  }
+
+  pi.registerTool(createRecallTool({
+    sessionsDir: piSessionsDir,
+    windowTokens: (ctx) => {
+      if (activeProfile.effectiveContextCap) return activeProfile.effectiveContextCap;
+      try {
+        return ctx?.getContextUsage?.()?.contextWindow ?? ctx?.model?.contextWindow;
+      } catch (e) {
+        // Observation may fail (CONVENTIONS loop-bounded-observation); the model's window is the fallback.
+        usageReadFailures++;
+        return ctx?.model?.contextWindow;
+      }
+    },
+  }, onRecallOutcome));
+
+  pi.events.on(BOUNDARY_EVENT, () => {
+    boundaryPending = true;
+  });
+
+  pi.registerCommand("cm-boundary", {
+    description: "Mark the end of a task: mask older tool results at the next model call (cm_recall still returns them)",
+    handler: async (_args, ctx) => {
+      boundaryPending = true;
+      ctx.ui?.notify?.(
+        `Task boundary set. The next model call masks older tool results if that frees at least ${formatBytes(BOUNDARY_MIN_BYTES)}.`,
+        "info",
+      );
+    },
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
     // v1.8.0: tool-call counter for telemetry (cheap: map increment per event).
-    // Captured unconditionally; only written to disk if opt-in is true.
     const rawTn = event.toolName ?? "unknown";
     const tn = ALLOWED_TOOL_NAMES.has(rawTn) ? rawTn : "other";
     toolCounts.set(tn, (toolCounts.get(tn) ?? 0) + 1);
-    // v1.4.0: re-read detection for read tool. Uses FIRST-mask turn.
     if (event.toolName === "read") {
       const path = (event.input as { path?: string })?.path;
-      if (path && maskedReadPaths.has(path)) {
-        const maskedTurn = maskedReadPaths.get(path)!;
-        reReadByRead++;
-        reReadTurnsDeltaSum += Math.max(0, turnCounter - maskedTurn);
-        maskedReadPaths.delete(path);  // consumed; if re-masked later, set again as fresh first-mask
-      }
+      if (path) noteReadAgain(path);
       return;  // read output untouched by compressor filters
     }
     if (event.toolName !== "bash") return;
-    // Don't skip errors — traceback filter specifically targets error output
-
     const command = (event.input as { command?: string })?.command;
     if (!command) return;
+    // Before any early return: a short `bd close` output still ends a task.
+    if (isBoundaryCommand(command, USER_RULES)) boundaryPending = true;
+    noteBashAgain(command);
+    return filterBashResult(event, command, ctx);
+  });
 
-    // v1.4.0: re-read detection for bash. Uses FIRST-mask turn.
-    if (maskedBashCommands.has(command)) {
-      const maskedTurn = maskedBashCommands.get(command)!;
-      reReadByBash++;
-      reReadTurnsDeltaSum += Math.max(0, turnCounter - maskedTurn);
-      maskedBashCommands.delete(command);
-    }
+  /** v1.4.0 re-read telemetry (first-mask turn) and v1.11.0 recall_then_rerun for a read. */
+  function noteReadAgain(path: string): void {
+    noteRerunAfterRecall("read", path);
+    if (!maskedReadPaths.has(path)) return;
+    reReadByRead++;
+    reReadTurnsDeltaSum += Math.max(0, turnCounter - maskedReadPaths.get(path)!);
+    maskedReadPaths.delete(path);  // consumed; if re-masked later, set again as fresh first-mask
+  }
 
-    // Extract text content from tool result (preserve non-text blocks like images)
+  /** v1.4.0 re-read telemetry and v1.11.0 recall_then_rerun for a bash command. */
+  function noteBashAgain(command: string): void {
+    noteRerunAfterRecall("bash", command);
+    if (!maskedBashCommands.has(command)) return;
+    reReadByBash++;
+    reReadTurnsDeltaSum += Math.max(0, turnCounter - maskedBashCommands.get(command)!);
+    maskedBashCommands.delete(command);
+  }
+
+  /** Strip ANSI and run the semantic filters on a bash result. When a filter
+   *  changed the text, the text from before it goes into details (saved in
+   *  the session file, never sent to the model) for cm_recall raw, unless
+   *  the filter hides secrets (CM-ADR-002 §2). Errors are filtered too: the
+   *  traceback filter targets them. */
+  function filterBashResult(event: any, command: string, ctx: any): Record<string, unknown> | undefined {
     const textParts = event.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text);
-    const nonTextBlocks = event.content.filter((c) => c.type !== "text");
+      .filter((c: any): c is { type: "text"; text: string } => c.type === "text")
+      .map((c: any) => c.text);
+    const nonTextBlocks = event.content.filter((c: any) => c.type !== "text");
     const originalText = textParts.join("\n");
+    if (originalText.length === 0) return undefined;
 
-    if (originalText.length === 0) return;
-
-    // ANSI strip runs first on ALL bash output (zero info loss)
-    let stdout = stripAnsi(originalText);
-
+    const stdout = stripAnsi(originalText);  // zero information loss
     totalCommands++;
-
-    // Try semantic compression
     const result = dispatch(command, stdout);
     const finalOutput = result ? result.output : stdout;
-
     const saved = originalText.length - finalOutput.length;
-    if (saved <= 0) return;
+    if (saved <= 0) return undefined;
 
     totalOriginal += originalText.length;
     totalCompressed += finalOutput.length;
     compressedCount++;
-
-    const totalSaved = totalOriginal - totalCompressed;
-    const pct = totalOriginal > 0 ? Math.round((totalSaved / totalOriginal) * 100) : 0;
     if (config.showStatus) {
-      _ctx.ui?.setStatus?.(
-        "token-savings",
-        `↓${formatBytes(totalSaved)} ${compressedCount}/${totalCommands} ${pct}%`,
-      );
+      const totalSaved = totalOriginal - totalCompressed;
+      const pct = totalOriginal > 0 ? Math.round((totalSaved / totalOriginal) * 100) : 0;
+      ctx?.ui?.setStatus?.("token-savings", `↓${formatBytes(totalSaved)} ${compressedCount}/${totalCommands} ${pct}%`);
     }
 
-    const content: Record<string, unknown>[] = [
-      { type: "text" as const, text: finalOutput },
-      ...nonTextBlocks,
-    ];
-    const ret: Record<string, unknown> = { content };
+    const ret: Record<string, unknown> = { content: [{ type: "text" as const, text: finalOutput }, ...nonTextBlocks] };
+    if (result) ret.details = { ...(event.details ?? {}), condensedMilk: rawKeep(stdout, result.sensitive === true) };
     if (event.isError) ret.isError = true;
     return ret;
-  });
+  }
 
   // Context-level retroactive compression
   // Compresses old bash tool results before each LLM call
@@ -585,128 +717,192 @@ export default function tokenCompressor(pi: ExtensionAPI) {
 
   pi.on("context", async (event, ctx) => {
     turnCounter++;
-
-    // Recalculate cumulative cache stats from all assistant messages.
-    // Analytical sum — no full-history JSON.stringify (v1.1.0 perf fix).
-    totalCacheRead = 0;
-    totalCacheWrite = 0;
-    totalInput = 0;
-    totalOutput = 0;
-    let lastUsage: { input: number; output: number; cacheRead: number; cacheWrite: number } | null = null;
-
-    for (const m of event.messages) {
-      const msg = (m as any)?.message ?? m;
-      if (msg?.role === "assistant" && msg?.usage) {
-        const u = msg.usage;
-        totalCacheRead += u.cacheRead ?? 0;
-        totalCacheWrite += u.cacheWrite ?? 0;
-        totalInput += u.input ?? 0;
-        totalOutput += u.output ?? 0;
-        lastUsage = {
-          input: u.input ?? 0,
-          output: u.output ?? 0,
-          cacheRead: u.cacheRead ?? 0,
-          cacheWrite: u.cacheWrite ?? 0,
-        };
-      }
-    }
-
-    // Read current context usage to drive static-cutoff decision.
-    // v1.10.0: when the active profile sets effectiveContextCap, use it
-    // as the denominator instead of the model's advertised window.
-    // Forces compression to engage earlier on backends where the
-    // advertised window outruns the proven long-context regime
-    // (e.g. Qwen3.6 at 262K with YaRN — trigger inside the trained 131K).
-    let contextUsage = 0;
-    try {
-      const usage = (ctx as any).getContextUsage?.();
-      if (usage?.tokens && usage?.contextWindow) {
-        const denom = activeProfile.effectiveContextCap ?? usage.contextWindow;
-        contextUsage = usage.tokens / denom;
-      }
-    } catch {}
-
-    // v1.2.1 true-static cutoff: cutoff freezes at zone entry and does
-    // NOT re-derive from messages.length on subsequent turns. Eliminates
-    // the drift-write pattern observed in v1.2.0 at zone 2.
+    const lastUsage = sumSessionUsage(event.messages);
+    const contextUsage = readContextUsage(ctx);
     // v1.10.1: a persisted cutoff beyond the array means the history shrank
-    // under us (compaction or branch we got no event for). The v1.8.1 clamp
-    // min(cutoff, length) turned that into "mask everything" every turn;
-    // the correct response is the compaction reset.
+    // under us (compaction or a branch we got no event for): reset.
     if (persistentCutoff > event.messages.length) resetPositionState();
+    if (boundaryPending) applyBoundary(event.messages);
+    applyIdleAdvance(event.messages, ctx, contextUsage);
+    advancePressureZone(event.messages.length, contextUsage);
 
-    const decision = decideCutoff(event.messages.length, {
-      thresholds: config.thresholds,
-      coverage: config.coverage,
-      contextUsage,
-      previousCutoff: persistentCutoff,
-      zoneEntered,
-    });
-    if (decision.zoneAdvanced) {
-      zoneEntered = decision.activeZone;
-      persistentCutoff = decision.cutoffIdx;
-      // v1.8.0: record zone entry for telemetry.
-      zonesEnteredLog.push({
-        zone: decision.activeZone,
-        at_turn: turnCounter,
-        at_ctx_pct: contextUsage,
+    const result = compressStaleToolResults(event.messages, maskOptions(contextUsage));
+    if (result) recordMasks(result);
+    if (lastUsage) {
+      cacheHistory.push({
+        turn: turnCounter, ...lastUsage,
+        bytesCompressed: result?.bytesSaved ?? 0,
+        masksApplied: result?.masksApplied ?? 0,
       });
     }
+    if (result) return { messages: result.messages };
+  });
 
-    const result = compressStaleToolResults(event.messages, {
+  /** Options for one masking pass at the current cutoff and zone. */
+  function maskOptions(contextUsage: number): CompressOptions {
+    return {
       thresholds: config.thresholds,
       coverage: config.coverage,
       contextUsage,
       previousCutoff: persistentCutoff,
       zoneEntered,
       rules: USER_RULES,
-      // v1.10.0: profile-driven knobs.
       placeholderFormat: activeProfile.placeholderFormat,
       maskOldThinking: activeProfile.maskOldThinking,
+    };
+  }
+
+  /** Bytes a pass would free with the cutoff fixed at `cutoff` (no zone advance). */
+  function savedAtCutoff(messages: any[], cutoff: number): number {
+    if (cutoff <= 0) return 0;
+    const fixed = { ...maskOptions(0), previousCutoff: cutoff, zoneEntered: config.thresholds.length };
+    return compressStaleToolResults(messages, fixed)?.bytesSaved ?? 0;
+  }
+
+  /** CM-ADR-002 §4: move the cutoff to the newest result the model has seen.
+   *  Results after the newest assistant message are unseen and stay; masking
+   *  them would be the immediate deletion that lowered solve rates
+   *  (arXiv 2610.35496). Applied only when it frees BOUNDARY_MIN_BYTES. */
+  function applyBoundary(messages: any[]): void {
+    boundaryPending = false;
+    let candidate = messages.length;
+    for (let step = 0; step < messages.length && candidate > 0; step++) {
+      if ((messages[candidate - 1]?.message ?? messages[candidate - 1])?.role !== "toolResult") break;
+      candidate--;
+    }
+    const applies = candidate > persistentCutoff && passesMinBytes({
+      candidateSaved: savedAtCutoff(messages, candidate),
+      currentSaved: savedAtCutoff(messages, persistentCutoff),
+      minBytes: BOUNDARY_MIN_BYTES,
     });
-    const turnBytesCompressed = result?.bytesSaved ?? 0;
-    const turnMasksApplied = result?.masksApplied ?? 0;
+    if (!applies) {
+      triggerStats.boundaries_skipped++;
+      return;
+    }
+    if (candidate > messages.length) throw new Error("applyBoundary: cutoff past the end of messages");
+    persistentCutoff = candidate;
+    triggerStats.boundaries_applied++;
+  }
 
-    if (result) {
-      contextSaved += result.bytesSaved;
-      contextMaskEvents++;
-      // v1.4.0: record each item only on its FIRST mask. pi re-feeds the
-      // raw messages each context event so the same items re-appear in
-      // result.maskedPaths/maskedCommands every turn — ignore repeats.
-      for (const p of result.maskedPaths) {
-        if (!everMaskedReads.has(p)) {
-          everMaskedReads.add(p);
-          contextMasksTotal++;
-        }
-        if (!maskedReadPaths.has(p)) maskedReadPaths.set(p, turnCounter);
+  /** CM-ADR-002 §5: when the cache lifetime has passed since the last cache
+   *  touch, the next call rewrites the prefix anyway, so enter the next zone
+   *  now. Once per idle period; same byte floor as a boundary. */
+  function applyIdleAdvance(messages: any[], ctx: any, contextUsage: number): void {
+    const ttlMs = cacheTtlMs({
+      configSeconds: config.cacheTtlSeconds,
+      promptCache: ctx?.model?.promptCache,
+      retention: process.env.PI_CACHE_RETENTION === "long" ? "long" : "short",
+    });
+    if (ttlMs === undefined) return;
+    const lastTouchMs = lastCacheTouchMs({ messages, tailEntries: tailEntries(ctx) });
+    if (lastTouchMs === undefined || lastTouchMs === idleHandledTouchMs) return;
+    const zone = decideIdleZone({ nowMs: Date.now(), lastTouchMs, ttlMs, zoneEntered, zoneCount: config.thresholds.length });
+    if (zone === null) return;
+    idleHandledTouchMs = lastTouchMs;
+    const candidate = Math.max(persistentCutoff, Math.floor(messages.length * config.coverage[zone]));
+    const applies = passesMinBytes({
+      candidateSaved: savedAtCutoff(messages, candidate),
+      currentSaved: savedAtCutoff(messages, persistentCutoff),
+      minBytes: BOUNDARY_MIN_BYTES,
+    });
+    if (!applies) {
+      triggerStats.idle_skipped++;
+      return;
+    }
+    if (candidate > messages.length) throw new Error("applyIdleAdvance: cutoff past the end of messages");
+    if (zone <= zoneEntered) throw new Error("applyIdleAdvance: zones only move forward");
+    zoneEntered = zone;
+    persistentCutoff = candidate;
+    zonesEnteredLog.push({ zone, at_turn: turnCounter, at_ctx_pct: contextUsage, by: "idle" });
+    triggerStats.idle_advances++;
+  }
+
+  /** Session entries from the leaf back to the newest assistant message, at
+   *  most IDLE_SCAN_ENTRIES_MAX: where pi's cache_warm usage entries sit. */
+  function tailEntries(ctx: any): any[] {
+    const sm = ctx?.sessionManager;
+    if (typeof sm?.getLeafEntry !== "function" || typeof sm?.getEntry !== "function") return [];
+    const out: any[] = [];
+    let entry = sm.getLeafEntry();
+    for (let step = 0; step < IDLE_SCAN_ENTRIES_MAX && entry; step++) {
+      out.push(entry);
+      if (entry.type === "message" && entry.message?.role === "assistant") break;
+      entry = entry.parentId ? sm.getEntry(entry.parentId) : undefined;
+    }
+    return out;
+  }
+
+  /** v1.2.1 true-static pressure zones: the cutoff freezes at zone entry. */
+  function advancePressureZone(messageCount: number, contextUsage: number): void {
+    const decision = decideCutoff(messageCount, {
+      thresholds: config.thresholds,
+      coverage: config.coverage,
+      contextUsage,
+      previousCutoff: persistentCutoff,
+      zoneEntered,
+    });
+    if (!decision.zoneAdvanced) return;
+    zoneEntered = decision.activeZone;
+    persistentCutoff = decision.cutoffIdx;
+    zonesEnteredLog.push({ zone: decision.activeZone, at_turn: turnCounter, at_ctx_pct: contextUsage, by: "pressure" });
+  }
+
+  /** Context usage (0..1) for the static cutoff. v1.10.0: the profile's
+   *  effectiveContextCap replaces the advertised window when set. */
+  function readContextUsage(ctx: any): number {
+    try {
+      const usage = ctx?.getContextUsage?.();
+      if (!usage?.tokens || !usage?.contextWindow) return 0;
+      return usage.tokens / (activeProfile.effectiveContextCap ?? usage.contextWindow);
+    } catch (e) {
+      // Observation may fail (CONVENTIONS loop-bounded-observation): no
+      // pressure reading means no zone advance this turn, which is safe;
+      // usage_read_failures in telemetry shows how often it happens.
+      usageReadFailures++;
+      return 0;
+    }
+  }
+
+  /** Sum session token usage from assistant messages (analytical, no
+   *  JSON.stringify: v1.1.0 perf fix). Returns the newest usage. */
+  function sumSessionUsage(messages: any[]): { input: number; output: number; cacheRead: number; cacheWrite: number } | null {
+    totalCacheRead = 0;
+    totalCacheWrite = 0;
+    totalInput = 0;
+    totalOutput = 0;
+    let lastUsage: { input: number; output: number; cacheRead: number; cacheWrite: number } | null = null;
+    for (const m of messages) {
+      const u = ((m as any)?.message ?? m)?.role === "assistant" ? ((m as any)?.message ?? m).usage : undefined;
+      if (!u) continue;
+      lastUsage = { input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0 };
+      totalCacheRead += lastUsage.cacheRead;
+      totalCacheWrite += lastUsage.cacheWrite;
+      totalInput += lastUsage.input;
+      totalOutput += lastUsage.output;
+    }
+    return lastUsage;
+  }
+
+  /** v1.4.0: record each item only on its FIRST mask. pi re-feeds the raw
+   *  messages each context event, so the same items come back every turn. */
+  function recordMasks(result: CompressResult): void {
+    contextSaved += result.bytesSaved;
+    contextMaskEvents++;
+    for (const p of result.maskedPaths) {
+      if (!everMaskedReads.has(p)) {
+        everMaskedReads.add(p);
+        contextMasksTotal++;
       }
-      for (const c of result.maskedCommands) {
-        if (!everMaskedBashes.has(c)) {
-          everMaskedBashes.add(c);
-          contextMasksTotal++;
-        }
-        if (!maskedBashCommands.has(c)) maskedBashCommands.set(c, turnCounter);
+      if (!maskedReadPaths.has(p)) maskedReadPaths.set(p, turnCounter);
+    }
+    for (const c of result.maskedCommands) {
+      if (!everMaskedBashes.has(c)) {
+        everMaskedBashes.add(c);
+        contextMasksTotal++;
       }
-      // persistentCutoff already updated on zone transition; nothing to do here
+      if (!maskedBashCommands.has(c)) maskedBashCommands.set(c, turnCounter);
     }
-
-    // Record this turn
-    if (lastUsage) {
-      cacheHistory.push({
-        turn: turnCounter,
-        cacheRead: lastUsage.cacheRead,
-        cacheWrite: lastUsage.cacheWrite,
-        input: lastUsage.input,
-        output: lastUsage.output,
-        bytesCompressed: turnBytesCompressed,
-        masksApplied: turnMasksApplied,
-      });
-    }
-
-    if (result) {
-      return { messages: result.messages };
-    }
-  });
+  }
 
   // /compress-stats command
   pi.registerCommand("compress-stats", {
@@ -746,6 +942,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  Mask old thinking: ${activeProfile.maskOldThinking}`,
         `  Placeholder bash: ${activeProfile.placeholderFormat.bash}`,
         `  Placeholder read: ${activeProfile.placeholderFormat.read}`,
+        `  Placeholder recall: ${activeProfile.placeholderFormat.recall}`,
         ...(profileWarnings.length > 0
           ? ["  Profile warnings:", ...profileWarnings.map((w) => `    • ${w}`)]
           : []),
@@ -771,6 +968,17 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         // >1 case natural.
         `  Re-read ratio: reads ${everMaskedReads.size > 0 ? (reReadByRead / everMaskedReads.size).toFixed(2) : "0.00"}× | bashes ${everMaskedBashes.size > 0 ? (reReadByBash / everMaskedBashes.size).toFixed(2) : "0.00"}× (events per unique mask)`,
         `  Avg turns placeholder held: ${(reReadByRead + reReadByBash) > 0 ? (reReadTurnsDeltaSum / (reReadByRead + reReadByBash)).toFixed(1) : "—"}`,
+        "",
+        "Recall (v1.11.0: cm_recall)",
+        `  Recalls: ${recallStats.by_id} by id, ${recallStats.by_match} by match, ${recallStats.errors} errors`,
+        `  With grep: ${recallStats.with_grep} | raw: ${recallStats.with_raw} | other session: ${recallStats.cross_session}`,
+        `  Bytes returned: ${formatBytes(recallStats.bytes_returned)} | avg turns ago: ${recallStats.by_id > 0 ? (recallStats.turns_ago_sum / recallStats.by_id).toFixed(1) : "—"}`,
+        `  Recall then re-run: ${recallStats.then_rerun}`,
+        "",
+        "Triggers (v1.11.0)",
+        `  Task boundaries: ${triggerStats.boundaries_applied} applied, ${triggerStats.boundaries_skipped} skipped (under ${formatBytes(BOUNDARY_MIN_BYTES)})${boundaryPending ? ", 1 pending" : ""}`,
+        `  Idle advances: ${triggerStats.idle_advances} applied, ${triggerStats.idle_skipped} skipped`,
+        `  Context usage read failures: ${usageReadFailures}`,
         "",
         "Cache Impact",
         // v1.10.0: vLLM (older) populates `prompt_tokens_details: null`
@@ -933,6 +1141,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           `  maskOldThinking:      ${activeProfile.maskOldThinking}`,
           `  placeholder.bash:     ${activeProfile.placeholderFormat.bash}`,
           `  placeholder.read:     ${activeProfile.placeholderFormat.read}`,
+          `  placeholder.recall:   ${activeProfile.placeholderFormat.recall}`,
           "",
           `Built-in profiles:    ${builtinNames.join(", ")}`,
           "",
@@ -1024,6 +1233,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           "  · pressure zones entered (turn and ctx% at each)",
           "  · tool call counts by type (read/bash/edit/grep/etc.)",
           "  · mask events, unique masks, re-reads, avg placeholder hold",
+          "  · cm_recall counts (by id/match, errors, bytes returned, turns ago, re-runs after a recall)",
+          "  · task-boundary and idle trigger counts, context-usage read failures",
           "  · thresholds and coverage in use",
           "  · cache hit rate + total tokens by bucket",
           "  · condensed-milk version",
@@ -1031,7 +1242,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           "",
           "What is NOT recorded:",
           "  × ANY message or tool output content",
-          "  × file paths or tool inputs (only hashes)",
+          "  × file paths, tool inputs or cm_recall arguments (only hashes)",
           "  × environment variables, API keys, or identity info",
           "",
           "Data stays on your machine. No network. No automatic upload.",
@@ -1188,6 +1399,14 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       );
     },
   });
+}
+
+/** What a filtered bash result keeps in details.condensedMilk (CM-ADR-002 §2):
+ *  the text from before the filter, or why it is withheld. */
+function rawKeep(stdout: string, sensitive: boolean): { raw: string } | { rawWithheld: "secret" | "size" } {
+  if (sensitive) return { rawWithheld: "secret" };
+  if (Buffer.byteLength(stdout) > RAW_KEEP_BYTES_MAX) return { rawWithheld: "size" };
+  return { raw: stdout };
 }
 
 /** Count newline-terminated lines in a file without loading it fully. */

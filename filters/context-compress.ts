@@ -29,10 +29,28 @@
  *
  * v1.10.0 (Phase 1 of vLLM/Qwen support): per-profile placeholder
  * templates and an optional historical thinking-block masking pass.
+ *
+ * v1.11.0 (CM-ADR-001): placeholders carry `#<id>` (sha1 of the tool-call
+ * id) so `cm_recall` can return the original; `cm_recall` results are
+ * masked past the cutoff like bash results.
  */
 
 import type { PlaceholderTemplates, ThinkingMaskPolicy } from "./profiles.js";
-import { renderPlaceholder } from "./profiles.js";
+import { renderPlaceholder, DEFAULT_PLACEHOLDERS } from "./profiles.js";
+import { countLines, formatSize, shortId } from "./text-metrics.js";
+import { recallLabel } from "./recall.js";
+
+export { countLines, formatSize };
+
+/** Tool name of the recall tool; its results age like bash results (CM-ADR-002 §3). */
+export const RECALL_TOOL_NAME = "cm_recall";
+
+/** Placeholder text for a bash result whose command is not known. */
+const UNKNOWN_COMMAND = "(command unknown)";
+
+/** The bash placeholder shows at most this many characters of the command.
+ *  inherited: the v1.0 placeholder slice, kept so commands render the same prefix. */
+const PLACEHOLDER_COMMAND_CHARS_MAX = 80;
 
 /** Context-usage thresholds that trigger cutoff advancement.
  *  Must be monotonically increasing.
@@ -119,16 +137,20 @@ export interface UserConfig {
   referencePathSubstrings: string[];
   invalidationRules: { invalidator: string; invalidated: string }[];
   disableDefaults: boolean;
+  /** v1.11.0 (CM-ADR-002 §4): regexes matched against the cd-stripped bash
+   *  command; a match marks a task boundary. Empty by default. */
+  boundaryCommands: string[];
 }
 
 export function emptyUserConfig(): UserConfig {
-  return { referenceBasenames: [], referencePathSubstrings: [], invalidationRules: [], disableDefaults: false };
+  return { referenceBasenames: [], referencePathSubstrings: [], invalidationRules: [], disableDefaults: false, boundaryCommands: [] };
 }
 
 export interface ResolvedRules {
   basenames: ReadonlySet<string>;
   substrings: readonly string[];
   invalidationRules: readonly { invalidator: RegExp; invalidated: RegExp }[];
+  boundaryCommands: readonly RegExp[];
 }
 
 /** Pure transform UserConfig → ResolvedRules. Compiles user regex
@@ -147,7 +169,16 @@ export function resolveRules(user: UserConfig): ResolvedRules {
   const rules = user.disableDefaults
     ? userRules
     : [...DEFAULT_INVALIDATION_RULES, ...userRules];
-  return { basenames: new Set(baseNames), substrings: subs, invalidationRules: rules };
+  const boundaryCommands = (user.boundaryCommands ?? []).map((pattern) => new RegExp(pattern));
+  return { basenames: new Set(baseNames), substrings: subs, invalidationRules: rules, boundaryCommands };
+}
+
+/** True when the bash command, with its `cd X &&` prefixes removed, matches
+ *  a configured boundary pattern (CM-ADR-002 §4). */
+export function isBoundaryCommand(command: string, rules: ResolvedRules): boolean {
+  if (rules.boundaryCommands.length === 0) return false;
+  const stripped = parseCdPrefix(command).cmd;
+  return rules.boundaryCommands.some((pattern) => pattern.test(stripped));
 }
 
 /** Built-in default rules — used when caller doesn't inject a config.
@@ -237,21 +268,6 @@ function isReferenceFile(path: string, rules: ResolvedRules): boolean {
   return false;
 }
 
-/** Count newlines + 1 (matches `wc -l` + 1 semantics for non-trailing-newline files). */
-function countLines(s: string): number {
-  if (s.length === 0) return 0;
-  let n = 1;
-  for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
-  return n;
-}
-
-/** Deterministic size string — must not depend on locale or time. */
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
-
 export interface CompressResult {
   messages: any[];
   bytesSaved: number;
@@ -293,12 +309,6 @@ export interface CompressOptions {
   maskOldThinking?: ThinkingMaskPolicy;
 }
 
-/** v1.10.0 fallback templates — exact byte match for the v1.9.0
- *  hardcoded strings. Used when no profile is supplied. */
-const FALLBACK_PLACEHOLDERS: PlaceholderTemplates = {
-  bash: "[cm-masked bash] {cmd}",
-  read: "[cm-masked read] {path} ({n} lines, {size})",
-};
 
 /** v1.10.0 deterministic constant for masked thinking blocks. Empty
  *  string keeps prefix bytes minimal AND identical across turns —
@@ -366,126 +376,142 @@ export function decideCutoff(
 /**
  * Process messages with static-cutoff masking.
  * Returns null if nothing to mask at the current cutoff.
+ *
+ * Each message goes through maskMessage(); this function only sums the
+ * outcomes. Order, count, roles and tool-call ids never change; only the
+ * text of masked results does (property-tested in tests/placeholders.test.mjs).
  */
 export function compressStaleToolResults(
   messages: any[],
   opts: CompressOptions = {},
 ): CompressResult | null {
-  const rules = opts.rules ?? DEFAULT_RULES;
   const { cutoffIdx } = decideCutoff(messages.length, opts);
-
   if (cutoffIdx <= 0) return null;
+  if (cutoffIdx > messages.length) throw new Error("compressStaleToolResults: cutoff past the end of messages");
 
-  const toolCallIndex = buildToolCallIndex(messages);
+  const scope: MaskScope = {
+    messages,
+    cutoffIdx,
+    rules: opts.rules ?? DEFAULT_RULES,
+    templates: opts.placeholderFormat ?? DEFAULT_PLACEHOLDERS,
+    thinkingPolicy: opts.maskOldThinking ?? "off",
+    toolCallIndex: buildToolCallIndex(messages),
+  };
+  const outcomes = messages.map((m: any, idx: number) => maskMessage(m, idx, scope));
+  if (outcomes.length !== messages.length) throw new Error("compressStaleToolResults: masking changed the message count");
+  const applied = outcomes.filter((o) => o.bytesSaved !== null);
+  if (applied.length === 0) return null;
 
-  let bytesSaved = 0;
-  let masksApplied = 0;
-  const maskedPaths: string[] = [];
-  const maskedCommands: string[] = [];
-
-  const result = messages.map((m: any, idx: number) => {
-    const msg = m?.message ?? m;
-    if (isAlreadyMasked(msg)) return m;
-
-    // BASH: past cutoff OR invalidated by later command
-    if (isBashToolResult(msg) && !msg.isError) {
-      const content = extractTextContent(msg);
-      if (content.length < MIN_MASK_LENGTH) return m;
-
-      const command = extractCommand(msg, toolCallIndex);
-      const pastCutoff = idx < cutoffIdx;
-      const invalidated = !pastCutoff && isCommandInvalidated(command, messages, idx, toolCallIndex, rules);
-
-      if (pastCutoff || invalidated) {
-        // v1.9.0 (ADR-029): `cm-` prefix brands placeholder as a
-        // condensed-milk artifact (not a tool failure) — self-documenting
-        // for self-sufficient looping agents who only see placeholder text
-        // post-context_checkout. Bytes stay deterministic per message.
-        // v1.10.0: template comes from active profile (back-compat default
-        // matches v1.9.0 byte-for-byte).
-        const tpl = (opts.placeholderFormat ?? FALLBACK_PLACEHOLDERS).bash;
-        const placeholder = command
-          ? renderPlaceholder(tpl, { cmd: command.slice(0, 80) })
-          : renderPlaceholder(tpl, { cmd: "" }).trimEnd();
-        bytesSaved += content.length - placeholder.length;
-        masksApplied++;
-        if (command) maskedCommands.push(command);
-        return replaceContent(m, placeholder);
-      }
-    }
-
-    // READ: past cutoff AND not reference file
-    if (isReadToolResult(msg) && !msg.isError) {
-      const path = extractPath(msg, toolCallIndex);
-      const content = extractTextContent(msg);
-
-      if (path && content.length >= MIN_MASK_LENGTH && !isReferenceFile(path, rules) && idx < cutoffIdx) {
-        // v1.4.0: enrich read placeholder with deterministic size/line
-        // metadata so the model can decide whether to re-read without
-        // actually re-reading. Derived purely from the original content
-        // → byte-identical per message → cache prefix stays stable.
-        const lineCount = countLines(content);
-        const sizeStr = formatSize(content.length);
-        // v1.9.0 (ADR-029): `cm-` prefix (see bash branch above).
-        // v1.10.0: profile-supplied template (back-compat default identical to v1.9.0).
-        const tpl = (opts.placeholderFormat ?? FALLBACK_PLACEHOLDERS).read;
-        const placeholder = renderPlaceholder(tpl, { path, n: lineCount, size: sizeStr });
-        bytesSaved += content.length - placeholder.length;
-        masksApplied++;
-        maskedPaths.push(path);
-        return replaceContent(m, placeholder);
-      }
-    }
-
-    // v1.10.0: thinking-block masking on assistant messages.
-    // Only mutates messages strictly before cutoffIdx. Replaces thinking
-    // content with a deterministic empty string so post-cutoff bytes stay
-    // byte-identical turn-over-turn → cache prefix is unaffected.
-    const thinkingPolicy = opts.maskOldThinking ?? "off";
-    if (thinkingPolicy !== "off" && idx < cutoffIdx) {
-      const masked = maskAssistantThinking(m, thinkingPolicy);
-      if (masked.changed) {
-        bytesSaved += masked.bytesSaved;
-        masksApplied++;
-        return masked.message;
-      }
-    }
-
-    return m;
-  });
-
-  if (masksApplied === 0) return null;
-
-  return { messages: result, bytesSaved, masksApplied, cutoffIdx, maskedPaths, maskedCommands };
+  return {
+    messages: outcomes.map((o) => o.message),
+    bytesSaved: applied.reduce((sum, o) => sum + (o.bytesSaved ?? 0), 0),
+    masksApplied: applied.length,
+    cutoffIdx,
+    maskedPaths: applied.flatMap((o) => (o.path ? [o.path] : [])),
+    maskedCommands: applied.flatMap((o) => (o.command ? [o.command] : [])),
+  };
 }
 
-/** Scan messages, return Map<toolCallId, {command, path, cwd}> from
- *  assistant toolCall blocks. `command` is the RAW tool-call argument
- *  (preserved for the bash placeholder, which wants the cd-prefix
- *  visible to the model). `cwd` is parsed from a `cd X && ` prefix
- *  and used for invalidation scoping.
- *  Handles live + persisted shapes. */
-type ToolCallEntry = { command?: string; path?: string; cwd?: string };
-function buildToolCallIndex(messages: any[]): Map<string, ToolCallEntry> {
-  const idx = new Map<string, ToolCallEntry>();
-  for (const m of messages) {
-    const msg = m?.message ?? m;
-    if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
-    for (const block of msg.content) {
-      if (block?.type !== "toolCall") continue;
-      const id = block.id ?? block.toolCallId;
-      if (!id) continue;
-      const args = block.arguments ?? block.input ?? {};
-      const rawCmd = typeof args.command === "string" ? args.command : undefined;
-      const cwd = rawCmd ? parseCdPrefix(rawCmd).cwd : undefined;
-      idx.set(id, {
-        command: rawCmd,
-        path: typeof args.path === "string" ? args.path : undefined,
-        cwd,
-      });
-    }
+/** Everything maskMessage() needs that is the same for every message of one pass. */
+interface MaskScope {
+  messages: any[];
+  cutoffIdx: number;
+  rules: ResolvedRules;
+  templates: PlaceholderTemplates;
+  thinkingPolicy: ThinkingMaskPolicy;
+  toolCallIndex: Map<string, ToolCallEntry>;
+}
+
+/** One message after masking. `bytesSaved` is null when nothing changed. */
+interface MaskOutcome {
+  message: any;
+  bytesSaved: number | null;
+  command?: string;
+  path?: string;
+}
+
+/** Decide and apply the mask for one message: a tool result (by tool kind)
+ *  or old thinking. Errors, short results and placeholders are never masked. */
+function maskMessage(m: any, idx: number, scope: MaskScope): MaskOutcome {
+  const unchanged: MaskOutcome = { message: m, bytesSaved: null };
+  const msg = m?.message ?? m;
+  if (isAlreadyMasked(msg)) return unchanged;
+  const pastCutoff = idx < scope.cutoffIdx;
+  if (msg?.role === "toolResult") {
+    const content = msg.isError ? "" : extractTextContent(msg);
+    if (content.length < MIN_MASK_LENGTH) return unchanged;
+    const target: MaskTarget = { m, msg, idx, content, pastCutoff };
+    const vars = { id: shortId(String(msg.toolCallId ?? ""), msg.timestamp), n: countLines(content), size: formatSize(content.length) };
+    if (msg.toolName === "bash") return maskBash(target, vars, scope) ?? unchanged;
+    if (msg.toolName === "read") return maskRead(target, vars, scope) ?? unchanged;
+    if (msg.toolName === RECALL_TOOL_NAME) return maskRecall(target, vars, scope) ?? unchanged;
+    return unchanged;
   }
-  return idx;
+  // v1.10.0: thinking-block masking on assistant messages before the cutoff.
+  // The replacement is a deterministic empty string, so bytes stay
+  // identical turn-over-turn and the cache prefix is unaffected.
+  if (scope.thinkingPolicy === "off" || !pastCutoff) return unchanged;
+  const masked = maskAssistantThinking(m, scope.thinkingPolicy);
+  return masked.changed ? { message: masked.message, bytesSaved: masked.bytesSaved } : unchanged;
+}
+
+/** One tool result that is long enough to mask. */
+interface MaskTarget { m: any; msg: any; idx: number; content: string; pastCutoff: boolean }
+type PlaceholderVars = { id: string; n: number; size: string };
+
+/** Bash: masked past the cutoff, or earlier when a later command in the same
+ *  cwd invalidates it (ADR-024). */
+function maskBash(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): MaskOutcome | null {
+  const command = extractCommand(t.msg, scope.toolCallIndex);
+  const invalidated = !t.pastCutoff && command !== "" &&
+    isCommandInvalidated(command, scope.messages, t.idx, scope.toolCallIndex, scope.rules);
+  if (!t.pastCutoff && !invalidated) return null;
+  const cmd = command ? command.slice(0, PLACEHOLDER_COMMAND_CHARS_MAX) : UNKNOWN_COMMAND;
+  return applyMask(t.m, t.content, renderPlaceholder(scope.templates.bash, { ...vars, cmd }), { command: command || undefined });
+}
+
+/** Read: masked past the cutoff unless the path is a reference file. */
+function maskRead(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): MaskOutcome | null {
+  const path = extractPath(t.msg, scope.toolCallIndex);
+  if (!path || !t.pastCutoff || isReferenceFile(path, scope.rules)) return null;
+  return applyMask(t.m, t.content, renderPlaceholder(scope.templates.read, { ...vars, path }), { path });
+}
+
+/** cm_recall: masked past the cutoff, labelled with its arguments (CM-ADR-002 §3). */
+function maskRecall(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): MaskOutcome | null {
+  if (!t.pastCutoff) return null;
+  const cmd = scope.toolCallIndex.get(t.msg.toolCallId)?.recallLabel ?? UNKNOWN_COMMAND;
+  return applyMask(t.m, t.content, renderPlaceholder(scope.templates.recall, { ...vars, cmd }), {});
+}
+
+/** Replace a result's content with its placeholder and report what it saved. */
+function applyMask(m: any, content: string, placeholder: string, what: { command?: string; path?: string }): MaskOutcome {
+  return { message: replaceContent(m, placeholder), bytesSaved: content.length - placeholder.length, ...what };
+}
+
+/** Scan messages, return Map<toolCallId, {command, path, cwd, recallLabel}>
+ *  from assistant toolCall blocks. `command` is the RAW tool-call argument
+ *  (preserved for the bash placeholder, which wants the cd-prefix visible to
+ *  the model). `cwd` is parsed from a `cd X && ` prefix and used for
+ *  invalidation scoping. `recallLabel` is set for cm_recall calls.
+ *  Handles live + persisted shapes. */
+type ToolCallEntry = { command?: string; path?: string; cwd?: string; recallLabel?: string };
+function buildToolCallIndex(messages: any[]): Map<string, ToolCallEntry> {
+  const calls = messages
+    .map((m: any) => m?.message ?? m)
+    .filter((msg: any) => msg?.role === "assistant" && Array.isArray(msg.content))
+    .flatMap((msg: any) => msg.content.filter((block: any) => block?.type === "toolCall" && (block.id ?? block.toolCallId)));
+  return new Map(calls.map((block: any) => {
+    const args = block.arguments ?? block.input ?? {};
+    const rawCmd = typeof args.command === "string" ? args.command : undefined;
+    const entry: ToolCallEntry = {
+      command: rawCmd,
+      path: typeof args.path === "string" ? args.path : undefined,
+      cwd: rawCmd ? parseCdPrefix(rawCmd).cwd : undefined,
+      recallLabel: block.name === RECALL_TOOL_NAME ? recallLabel(args) : undefined,
+    };
+    return [block.id ?? block.toolCallId, entry] as [string, ToolCallEntry];
+  }));
 }
 
 /** v1.6.0: cwd-aware invalidation.
@@ -519,9 +545,6 @@ function isCommandInvalidated(
 
 function isBashToolResult(msg: any): boolean {
   return msg?.role === "toolResult" && msg?.toolName === "bash";
-}
-function isReadToolResult(msg: any): boolean {
-  return msg?.role === "toolResult" && msg?.toolName === "read";
 }
 function isAlreadyMasked(msg: any): boolean {
   if (msg?.role !== "toolResult") return false;

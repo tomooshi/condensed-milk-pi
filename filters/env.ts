@@ -39,7 +39,8 @@ function filterEnv(input: string): FilterResult | null {
   }
 
   const result = out.join("\n");
-  return result.length < input.length ? { output: result, category: "fast" } : null;
+  // sensitive: the raw text holds the secrets this filter masks (CM-ADR-002 §2).
+  return result.length < input.length ? { output: result, category: "fast", sensitive: true } : null;
 }
 
 function isSensitive(key: string): boolean {

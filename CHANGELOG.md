@@ -4,6 +4,9 @@ All notable changes to condensed-milk.
 
 ## [1.11.0] - 2026-11-01
 
+**Help tune the defaults:** if you turn on local telemetry, please share the anonymized
+export (`/compress-telemetry export`) in [issue #5](https://github.com/tomooshi/condensed-milk-pi/issues/5). Counts only; no content, no paths.
+
 Masked tool results can now be recalled exactly. Research, options and sources:
 `docs/research/2026-11-01-addressable-recall.md`. Decisions: `docs/adr/CM-ADR-001`
 and `docs/adr/CM-ADR-002`.

@@ -4,6 +4,8 @@
 
 Inspired by [ztk](https://github.com/codejunkie99/ztk) (Zig) and [RTK](https://github.com/rtk-ai/rtk) (Rust) — standalone CLI proxies for Claude Code — rebuilt as a native pi extension using `tool_result` post-processing and pi's `context` event. ANSI stripping, linter aggregation, and grep grouping techniques adapted from [pi-rtk-optimizer](https://github.com/MasuRii/pi-rtk-optimizer) by MasuRii. This architecture gives Condensed Milk capabilities that standalone proxies structurally cannot have.
 
+> **Help tune the defaults.** Telemetry is opt-in and stays on your machine. If you turn it on, please share the anonymized export in [issue #5](https://github.com/tomooshi/condensed-milk-pi/issues/5): counts only, no content, no paths. See [Telemetry](#2-telemetry-opt-in-local-only--configcondensed-milk-sessionsjsonl).
+
 ## What It Does
 
 ### Tool Result Compression
@@ -277,13 +279,16 @@ on graceful shutdown. The data feeds an upcoming per-user threshold adapter.
 It stays on your machine — nothing is uploaded, automatically or otherwise.
 
 **What's recorded per session:** session duration, final turn count, pressure
-zones entered (turn + context% at each), tool-call counts by type, mask
-statistics, thresholds and coverage in use, cache hit rate, total tokens by
-bucket, condensed-milk version, and sha256-truncated (16-char) hashes of the
-session path and cwd.
+zones entered (turn + context% at each, and which trigger), tool-call counts by
+type, mask statistics, thresholds and coverage in use, cache hit rate, total
+tokens by bucket, condensed-milk version, and sha256-truncated (16-char) hashes
+of the session path and cwd. Schema 2 (v1.11.0) adds `cm_recall` counts (by id,
+by match, errors, bytes returned, turns ago, re-runs after a recall),
+task-boundary and idle trigger counts, and context-usage read failures.
 
-**What's NOT recorded:** any message or tool output content, file paths or
-tool inputs (only hashes), environment variables, API keys, or identity info.
+**What's NOT recorded:** any message or tool output content, file paths,
+commands, tool inputs or `cm_recall` arguments (only hashes), environment
+variables, API keys, or identity info.
 
 **Three ways to opt in:**
 
@@ -306,8 +311,16 @@ cat ~/.config/condensed-milk-sessions.jsonl | jq   # view raw
 rm ~/.config/condensed-milk-sessions.jsonl         # delete local log
 ```
 
-If you want to help improve defaults, you can review the file and send it to
-the author manually. No automated upload path exists — by design.
+**Please share your export.** The defaults are tuned on one person's sessions,
+and your counters help set better ones for everyone. No automated upload path
+exists — by design — so sharing is a manual step:
+
+1. Turn on logging (above) and use pi as usual; 10 or more sessions is ideal.
+2. Run `/compress-telemetry export`. It writes an anonymized copy to `~/`, with
+   the session and cwd hashes replaced by sequential ids.
+3. Read it: `cat ~/condensed-milk-sessions-export-anonymized-*.jsonl | jq`
+4. Post it in [issue #5](https://github.com/tomooshi/condensed-milk-pi/issues/5): attach the file or paste the lines. Saying
+   which model, provider and profile you mostly use helps. The issue is public.
 
 ### 3. Rules — `~/.pi/agent/condensed-milk-config.json` (global) + `./condensed-milk.config.json` (project-local)
 

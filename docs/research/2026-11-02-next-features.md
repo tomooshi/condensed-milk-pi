@@ -531,3 +531,44 @@ runs name the right first change against independently captured payloads, 0 fals
 Probe finding: with an MCP server connecting mid-run, `pi-claude-code-use` changes `tools` twice per process (adds an
 alias at the first prompt, removes it at the second), so thinking is lost twice.
 The `cacheTtlSeconds` bug (§9.3) is fixed in the same release (spec test red on 1.11.1, green after).
+
+## 11. Release 1.13.0 plan: gates fixed before the build (2026-11-02)
+
+The operator asked for C, D, B1, restart persistence and a review of the boundary trigger in one release. §6.1 fixes
+the gates for C, D and B1. This section adds the gates that §6.1 did not have, and states how each §6.1 gate is
+measured, before any of the code exists. A feature that fails a gate does not ship; the result goes into §12.
+
+### 11.1 How the §6.1 gates are measured
+
+- Offline arms: base = the 1.12.0 source; candidate = 1.12.0 plus one feature, so each feature has its own paired
+  comparison. Same list as §9 (38 sessions, 51,472 calls), same seed 20261102, 10,000 resamples.
+- "Re-read tokens" = the harness `promptMtok` sum (prompt tokens over all claude calls). "Extra cache writes" =
+  `writeMtok` (arm minus base) divided by base `writeMtok`.
+- The harness counted every assistant message at its recorded output tokens, so it could not see an edit of
+  tool-call arguments. Change (before any C run): an assistant message costs its recorded output tokens minus the
+  characters an arm removed from it, divided by the fitted characters per token. For an arm that does not edit
+  assistant messages the change is exactly zero; an A/A run must stay exactly zero.
+- B1 needs the default rules (no operator rules config). Arms: base-default, B1-default, and a control with bash
+  invalidation switched off (noinv-default). "Warm in-run rewrites after an invalidation" = `cmEdits` that the
+  invalidation causes = arm minus noinv. Gate: (B1 - noinv) <= 0.5 x (base - noinv). "Drops after an invalidation
+  not above the base rate (CI)" = the 95% CI of B1 - base for `thinkingInvalidatedByEdit` does not lie entirely
+  above zero.
+- C probe providers: Anthropic through the operator's OAuth (pi-claude-code-use), OpenRouter (a small model with
+  tool calls), vLLM (local CPU server, Qwen2.5-1.5B-Instruct with the hermes tool parser). A provider that cannot
+  be run is reported as "not run", which fails the 3 of 3 gate.
+
+### 11.2 New gates
+
+| Item | Offline gates (replay) | Probe gates | Live gates |
+|---|---|---|---|
+| R. Keep the frozen cutoff across a pi restart | Thinking blocks invalidated by edits down (95% CI below zero); cost up by at most 1% of base cost (point estimate) and at most 2% (CI upper bound); after a compaction or branch change the restored state is never used (property test) | — | Same as C |
+| Boundary trigger (`boundaryCommands`) | No code change. The default is already empty. Report the §9.2 trade-off in the README so users can choose. | — | — |
+
+### 11.3 Live A/B in the release
+
+- A config switch `experiment.ab` assigns each session to `control` (1.12.0 behavior) or `treatment` (the adopted
+  features) from sha256("cm-ab-1:" + session id), so a resumed session keeps its arm.
+- Telemetry schema 4 adds the arm and the quality proxies of §6.1: user prompts, edit "could not find" errors,
+  tool errors and tool results.
+- Live gates are read after at least 14 days and at least 30 sessions per arm. A failed live gate turns the feature
+  off by default in the next release.

@@ -447,3 +447,37 @@ Consequences for condensed-milk if the operator switches: options B1 and B2 lose
 protect, and B2 cannot be injected); the prefix guard (A) must read response usage, because pi's
 `before_provider_request` never sees Claude Code's request; C and D work unchanged, because they act in pi's
 `context` event.
+
+### 8.11 Earlier thinking on the Earendil path: where it is lost, and whether it matters
+
+Question from the operator: is the missing earlier reasoning (8.10) a real problem, and is it discussed elsewhere?
+
+Where it is lost (three captures, same four-step prompt):
+
+| Path | What Anthropic receives for earlier assistant turns |
+|---|---|
+| Native Claude Code 2.1.316 (`claude -p`, then `claude -p --continue`, through a logging proxy) | Thinking kept in every earlier turn, across the tool loop and the second prompt (`a:TU`, `a:Tt`); `clear_thinking_20251015` with `keep: "all"` |
+| Earendil: frames that `pi-claude-code` writes to Claude Code's `stream-json` input | Signed thinking blocks present (`assistant thinking,tool_use`), 968-character signatures |
+| Earendil: the request that Claude Code then sends | No thinking in any earlier turn, also inside the same tool loop (`a:U`) |
+
+So Claude Code keeps its own thinking but leaves out thinking that arrives through `stream-json` input. Earendil
+passes it correctly. The cause inside Claude Code is not known, and no report of this exact case was found.
+
+Whether it matters:
+
+- Anthropic, April 23 postmortem: a Claude Code bug that cleared older thinking on every turn "made Claude seem
+  forgetful and repetitive"; it was treated as a quality regression and fixed. https://www.anthropic.com/engineering/april-23-postmortem
+- Anthropic, adaptive thinking docs: "When you have thinking blocks, pass them back unmodified, particularly during
+  tool use, where they carry the reasoning behind Claude's tool calls." Opus 4.5 and later keep all prior turns'
+  thinking by default (thinking docs, "Thinking block preservation by model").
+- claude-code issue 54482 (April-June 2026, closed as inactive): users saw thinking stripped from the prompt on every
+  turn of active sessions and described the effect as reasoning "against the visible response trail rather than its
+  own prior reasoning"; one user confirmed it on Opus 4.8. Self-reported, not confirmed by Anthropic.
+- No controlled measurement of the quality effect on Opus 5.5 was found. The 8.10 probes were too short to show one.
+
+Comparison with the current setup: there, earlier thinking is kept until a prefix edit drops the blocks before the
+edit; blocks produced after the edit are kept. On the Earendil path no earlier thinking reaches the model at all.
+
+Decision: the switch is not recommended on current evidence. It would trade a fixable loss (prefix edits, sections
+8.1-8.6) for a permanent one. Reopen if Claude Code starts passing `stream-json` thinking through, or if a paired
+test shows no quality loss.

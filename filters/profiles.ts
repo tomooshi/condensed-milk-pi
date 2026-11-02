@@ -42,6 +42,10 @@ export interface PlaceholderTemplates {
   read: string;
   /** Substituted: {id}, {cmd} = the recall label (`id=… grep="…"`), {n}, {size}. */
   recall: string;
+  /** v1.13.0 (CM-ADR-005): one masked string argument of an edit, write or
+   *  bash call. Substituted: {id} = the arguments id, {cmd} = `<tool> <key
+   *  path>` (for example `edit edits[0].oldText`), {n}, {size}. */
+  arg: string;
 }
 
 /** CM-ADR-001 default templates, shared by both built-in profiles. */
@@ -49,6 +53,7 @@ export const DEFAULT_PLACEHOLDERS: PlaceholderTemplates = {
   bash: "[cm-masked bash #{id}] {cmd} ({n} lines, {size})",
   read: "[cm-masked read #{id}] {path} ({n} lines, {size})",
   recall: "[cm-masked recall #{id}] {cmd} ({n} lines, {size})",
+  arg: "[cm-masked arg #{id}] {cmd} ({n} lines, {size})",
 };
 
 /** Profile shape — every backend-specific knob in one place. */
@@ -233,6 +238,7 @@ function applyOverride(
       bash: override.placeholderFormat.bash ?? base.placeholderFormat.bash,
       read: override.placeholderFormat.read ?? base.placeholderFormat.read,
       recall: override.placeholderFormat.recall ?? base.placeholderFormat.recall,
+      arg: override.placeholderFormat.arg ?? base.placeholderFormat.arg ?? DEFAULT_PLACEHOLDERS.arg,
     };
     // CM-ADR-001 §5: a template without {id} still works, but cm_recall
     // cannot address what it masks, so say so where the user looks.

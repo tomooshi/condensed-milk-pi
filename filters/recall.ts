@@ -12,6 +12,7 @@
  * hit, returns the original text byte for byte after the first blank line.
  */
 import { countLines, formatSize, shortId, SHORT_ID_HEX_CHARS } from "./text-metrics.js";
+import { argsId, argsText, maskableLeaves } from "./args-mask.js";
 
 export { shortId, SHORT_ID_HEX_CHARS };
 
@@ -59,6 +60,10 @@ export interface LightEntry {
   kind: "assistant" | "result" | "other";
   /** assistant: tool calls made, with their display labels. */
   calls?: { toolCallId: string; label: string }[];
+  /** assistant (v1.13.0, CM-ADR-005): calls whose arguments a mask can
+   *  replace, with the size of their argsText. Their id is
+   *  argsId(toolCallId, timestamp of the assistant message). */
+  argCalls?: { toolCallId: string; toolName: string; lineCount: number; size: number }[];
   /** result: identity and shape of the tool result. The id is
    *  shortId(toolCallId, timestamp), as in the placeholder. */
   toolCallId?: string;
@@ -85,6 +90,8 @@ export interface RecallRecord {
   filtered: boolean;
   rawWithheld?: string;
   isError: boolean;
+  /** v1.13.0: "args" = the arguments of a call (masked by C), else a result. */
+  kind: "result" | "args";
 }
 
 export interface RecallScan {
@@ -159,10 +166,15 @@ export function lightEntry(entry: any): LightEntry {
   const msg = entry.type === "message" ? entry.message : undefined;
   if (msg?.role === "assistant") {
     const blocks = Array.isArray(msg.content) ? msg.content : [];
-    const calls = blocks
-      .filter((b: any) => b?.type === "toolCall" && typeof (b.id ?? b.toolCallId) === "string")
-      .map((b: any) => ({ toolCallId: b.id ?? b.toolCallId, label: labelKey(callLabel(String(b.name ?? ""), b.arguments ?? b.input ?? {})) }));
-    return { ...base, kind: "assistant", calls };
+    const toolCalls = blocks.filter((b: any) => b?.type === "toolCall" && typeof (b.id ?? b.toolCallId) === "string");
+    const calls = toolCalls.map((b: any) => ({ toolCallId: b.id ?? b.toolCallId, label: labelKey(callLabel(String(b.name ?? ""), b.arguments ?? b.input ?? {})) }));
+    const argCalls = toolCalls
+      .filter((b: any) => maskableLeaves(String(b.name ?? ""), b.arguments ?? b.input).length > 0)
+      .map((b: any) => {
+        const text = argsText(b.arguments ?? b.input);
+        return { toolCallId: b.id ?? b.toolCallId, toolName: String(b.name), lineCount: countLines(text), size: text.length };
+      });
+    return { ...base, kind: "assistant", calls, argCalls, timestamp: msg.timestamp };
   }
   if (msg?.role === "toolResult" && typeof msg.toolCallId === "string") {
     const text = toolResultText(msg);
@@ -210,12 +222,19 @@ export function buildRecords(branch: LightEntry[], scanMax: number): RecallScan 
     return acc;
   }, []);
   const records = window.flatMap((e, i): RecallRecord[] => {
+    if (e.kind === "assistant") {
+      return (e.argCalls ?? []).map((c) => ({
+        id: argsId(c.toolCallId, e.timestamp), entryId: e.id, toolCallId: c.toolCallId, toolName: c.toolName,
+        label: `${labels.get(c.toolCallId) ?? "(unknown)"} (arguments)`, lineCount: c.lineCount, size: c.size,
+        turnsAgo: assistantsAfter[i], filtered: false, isError: false, kind: "args" as const,
+      }));
+    }
     if (e.kind !== "result" || !e.toolCallId) return [];
     const label = labels.get(e.toolCallId) ?? "(command unknown)";
     return [{
       id: shortId(e.toolCallId, e.timestamp), entryId: e.id, toolCallId: e.toolCallId, toolName: e.toolName ?? "unknown",
       label, lineCount: e.lineCount ?? 0, size: e.size ?? 0, turnsAgo: assistantsAfter[i],
-      filtered: e.filtered === true, rawWithheld: e.rawWithheld, isError: e.isError === true,
+      filtered: e.filtered === true, rawWithheld: e.rawWithheld, isError: e.isError === true, kind: "result" as const,
     }];
   });
   if (records.length > window.length) throw new Error("buildRecords: more records than scanned entries");
@@ -298,6 +317,9 @@ export function planRecall(records: RecallRecord[], request: RecallRequest, scan
     const head = `cm_recall: #${id} is shared by ${found.records.length} tool results, so it cannot pick one. Re-run the command or re-read the file instead:`;
     return { kind: "error", text: [head, ...found.records.map(row)].join("\n") };
   }
+  if (request.raw === true && found.record.kind === "args") {
+    return err(`#${id} is the arguments of a call; raw works only with tool results.`);
+  }
   if (request.raw === true && found.record.rawWithheld === "secret") {
     return err(`#${id} has no raw text, because its filter hides secrets.`);
   }
@@ -317,7 +339,8 @@ export function recallBytesCap(windowTokens: number | undefined): number {
 }
 
 /** Header kind for the text being returned. */
-function sourceKind(raw: boolean, rawText: string | undefined): string {
+function sourceKind(raw: boolean, rawText: string | undefined, kind: RecallRecord["kind"]): string {
+  if (kind === "args") return "arguments as first sent";
   if (!raw) return "original output as first shown";
   return rawText !== undefined
     ? "raw output from before the condensed-milk filter"
@@ -383,7 +406,7 @@ export function renderRecall(input: {
     return err(`offset ${request.offset} is past the end of #${record.id} (${lines.length} lines).`);
   }
   const from = input.sessionId ? ` From session ${input.sessionId}.` : "";
-  const header = `[cm-recall #${record.id}] ${record.toolName}: ${oneLine(record.label)} — ${sourceKind(request.raw === true, input.raw)}, ${record.turnsAgo} turns ago, not the current state.${from}`;
+  const header = `[cm-recall #${record.id}] ${record.toolName}: ${oneLine(record.label)} — ${sourceKind(request.raw === true, input.raw, record.kind)}, ${record.turnsAgo} turns ago, not the current state.${from}`;
   const picked = selectLines(lines, request);
   const grep = request.grep !== undefined;
   const fit = fitCaps(picked.numbered, grep ? (l) => `${l.n}: ${l.text}` : (l) => l.text, input);

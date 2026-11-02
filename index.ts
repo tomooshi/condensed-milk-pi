@@ -55,6 +55,15 @@ import {
 } from "./filters/triggers.js";
 import { createRecallTool, type RecallOutcome } from "./io/recall-tool.js";
 import { comparePayloads, type PrefixChange } from "./filters/prefix-guard.js";
+import {
+  STATE_ENTRY_TYPE,
+  DEFAULT_FEATURES,
+  restoreState,
+  resolveFeatures,
+  stateEntryData,
+  type Arm,
+  type Features,
+} from "./filters/session-state.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 import {
   resolveProfile,
@@ -114,8 +123,9 @@ const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
 const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.jsonl");
 // v1.11.0: schema 2 adds recall and trigger counters (CM-ADR-002 §7).
 // v1.12.0: schema 3 adds prefix-guard counters (CM-ADR-004).
-const TELEMETRY_SCHEMA_VERSION = 3;
-const PACKAGE_VERSION = "1.12.0";
+// v1.13.0: schema 4 adds the A/B arm, features and quality proxies (CM-ADR-007).
+const TELEMETRY_SCHEMA_VERSION = 4;
+const PACKAGE_VERSION = "1.13.0";
 
 /** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
  *  extension (e.g. user-installed third-party tools with identifying names)
@@ -298,12 +308,33 @@ const USER_RULES: ResolvedRules = resolveRules(loadUserRulesConfig());
 // edit here is a deliberate cache bust and MUST be ADR'd.
 // v1.11.0 (CM-ADR-001): names cm_recall and says when to recall and when
 // to re-run; agents use a recall tool only when told to (StructMemEval).
+// v1.13.0 (CM-ADR-005): names masked arguments, and forbids copying a
+// placeholder into a new call (an edit with a placeholder as oldText fails).
 const CM_EXPLAINER =
-  "\n\ncondensed-milk: old tool results can appear as `[cm-masked bash|read|recall #id] …`\n" +
-  "to keep the prompt cache stable. To see one exactly as it was first shown, call\n" +
-  "`cm_recall` with the id (add `grep`, or `offset`/`limit`, for part of it). To see the\n" +
-  "current state, re-run the command or re-read the file. Each costs one step, so do it\n" +
-  "only when the next step needs the content.";
+  "\n\ncondensed-milk: old tool results and long tool-call arguments can appear as\n" +
+  "`[cm-masked bash|read|recall|arg #id] …` to keep the prompt cache stable. To see one\n" +
+  "exactly as it was first shown, call `cm_recall` with the id (add `grep`, or\n" +
+  "`offset`/`limit`, for part of it). To see the current state, re-run the command or\n" +
+  "re-read the file. Each costs one step, so do it only when the next step needs the content.\n" +
+  "Never copy a placeholder into a new tool call.";
+
+/** v1.13.0: read the raw config object for `features` and `experiment`
+ *  (CM-ADR-007). A missing or unreadable file means defaults. */
+function loadRawConfig(): Record<string, unknown> {
+  let raw: string;
+  try {
+    raw = readFileSync(CONFIG_PATH, "utf-8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new Error(`condensed-milk: cannot read ${CONFIG_PATH}: ${(e as Error).message}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    process.stderr.write(`condensed-milk: ${CONFIG_PATH} is not valid JSON (${(e as Error).message}); 1.13.0 features use their defaults.\n`);
+    return {};
+  }
+}
 
 /** Channel another extension (an orchestrator) emits on to mark a task boundary. */
 const BOUNDARY_EVENT = "condensed-milk:boundary";
@@ -337,9 +368,10 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   // Chained by pi across extensions (per BeforeAgentStartEventResult docs)
   // — safe to compose with other extensions contributing systemPrompt.
   // Constant string → byte-identical turn-over-turn → cache-stable.
-  pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt + CM_EXPLAINER,
-  }));
+  pi.on("before_agent_start", (event) => {
+    userPrompts++;  // v1.13.0 quality proxy: turns per prompt (CM-ADR-007)
+    return { systemPrompt: event.systemPrompt + CM_EXPLAINER };
+  });
 
   // Subagents: compress too — they benefit from smaller output
   let totalOriginal = 0;
@@ -402,6 +434,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     toolCounts.clear();
     zonesEnteredLog.length = 0;
     resetRecallAndTriggerStats();
+    resetFeatureState(ctx);
     // Reload telemetry config at session start so toggle via /compress-telemetry
     // in a previous session is honored without requiring full pi restart.
     telemetryConfig = loadTelemetryConfig();
@@ -455,6 +488,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   function resetPositionState(): void {
     persistentCutoff = 0;
     zoneEntered = -1;
+    maskHorizon = 0;
+    lastStateKey = null;
     // Clear mask trackers: placeholders in compact summary aren't tracked by
     // us, and re-read telemetry should restart clean since the
     // "original placeholder turn" recorded in these maps no longer
@@ -548,6 +583,17 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         thinking_dropped_after_edit: guard.droppedAfterEdit,
         cache_write_after_edit: guard.cacheWriteAfterEdit,
         prefix_guard_failures: guard.failures,
+        // v1.13.0 schema 4 (CM-ADR-007)
+        arm,
+        features: { ...features },
+        user_prompts: userPrompts,
+        tool_results: toolResultsCount,
+        tool_errors: toolErrors,
+        edit_not_found: editNotFound,
+        args_masked: argsMaskedCalls.size,
+        collapsed: collapsedCalls.size,
+        state_restored: stateRestored,
+        state_writes: stateWrites,
       };
       mkdirSync(dirname(TELEMETRY_LOG_PATH), { recursive: true });
       appendFileSync(TELEMETRY_LOG_PATH, JSON.stringify(entry) + "\n");
@@ -570,6 +616,61 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   };
   /** `bash:<command>` / `read:<path>` keys of recalled results, oldest first. */
   const recalledKeys = new Set<string>();
+
+  // v1.13.0 (CM-ADR-005/006/007): features, the event horizon, the restart
+  // state and the quality proxies of the live A/B.
+  let features: Features = { ...DEFAULT_FEATURES };
+  let arm: Arm = "default";
+  let maskHorizon = 0;
+  let lastStateKey: string | null = null;
+  let stateRestored = false;
+  let stateWrites = 0;
+  const argsMaskedCalls = new Set<string>();
+  const collapsedCalls = new Set<string>();
+  let userPrompts = 0;
+  let toolResultsCount = 0;
+  let toolErrors = 0;
+  let editNotFound = 0;
+
+  /** Session start: pick the features (and the A/B arm), reset the counters,
+   *  and restore the branch's mask state when persistCutoff is on. */
+  function resetFeatureState(ctx: any): void {
+    const sessionId = String(ctx?.sessionManager?.getSessionId?.() ?? "unknown");
+    ({ arm, features } = resolveFeatures(loadRawConfig(), sessionId));
+    maskHorizon = 0;
+    lastStateKey = null;
+    stateRestored = false;
+    stateWrites = 0;
+    argsMaskedCalls.clear();
+    collapsedCalls.clear();
+    userPrompts = 0;
+    toolResultsCount = 0;
+    toolErrors = 0;
+    editNotFound = 0;
+    if (!features.persistCutoff || typeof ctx?.sessionManager?.getBranch !== "function") return;
+    const restored = restoreState(ctx.sessionManager.getBranch());
+    if (!restored) return;
+    persistentCutoff = restored.cutoff;
+    zoneEntered = restored.zone;
+    maskHorizon = restored.horizon;
+    lastStateKey = stateKey();
+    stateRestored = true;
+  }
+
+  function stateKey(): string {
+    return `${persistentCutoff}|${zoneEntered}|${maskHorizon}`;
+  }
+
+  /** After a mask event: one state entry per change (CM-ADR-006). The entry
+   *  never reaches the model; pi keeps it in the session file. */
+  function persistState(): void {
+    if (!features.persistCutoff || typeof (pi as any).appendEntry !== "function") return;
+    const key = stateKey();
+    if (key === lastStateKey) return;
+    pi.appendEntry(STATE_ENTRY_TYPE, stateEntryData({ cutoff: persistentCutoff, zone: zoneEntered, horizon: maskHorizon }));
+    lastStateKey = key;
+    stateWrites++;
+  }
 
   // v1.12.0 (CM-ADR-004): prefix guard. Observes each provider request and
   // never changes it; the response then tells what the change cost.
@@ -713,6 +814,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     const rawTn = event.toolName ?? "unknown";
     const tn = ALLOWED_TOOL_NAMES.has(rawTn) ? rawTn : "other";
     toolCounts.set(tn, (toolCounts.get(tn) ?? 0) + 1);
+    noteQualityProxies(event);
     if (event.toolName === "read") {
       const path = (event.input as { path?: string })?.path;
       if (path) noteReadAgain(path);
@@ -726,6 +828,16 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     noteBashAgain(command);
     return filterBashResult(event, command, ctx);
   });
+
+  /** v1.13.0 (CM-ADR-007) live-gate proxies: tool errors and edits that did
+   *  not find their old text (a masked argument copied into a call fails so). */
+  function noteQualityProxies(event: any): void {
+    toolResultsCount++;
+    if (event.isError !== true) return;
+    toolErrors++;
+    const text = (event.content ?? []).filter((c: any) => c?.type === "text").map((c: any) => c.text ?? "").join("\n");
+    if (event.toolName === "edit" && text.includes("Could not find")) editNotFound++;
+  }
 
   /** v1.4.0 re-read telemetry (first-mask turn) and v1.11.0 recall_then_rerun for a read. */
   function noteReadAgain(path: string): void {
@@ -810,9 +922,16 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     // v1.10.1: a persisted cutoff beyond the array means the history shrank
     // under us (compaction or a branch we got no event for): reset.
     if (persistentCutoff > event.messages.length) resetPositionState();
+    const before = `${persistentCutoff}|${zoneEntered}`;
     if (boundaryPending) applyBoundary(event.messages);
     applyIdleAdvance(event.messages, ctx, contextUsage);
     advancePressureZone(event.messages.length, contextUsage);
+    // v1.13.0 (CM-ADR-005): a mask event moves the horizon, the only point at
+    // which collapse (D) and batched invalidation (B1) may change bytes.
+    if (`${persistentCutoff}|${zoneEntered}` !== before) {
+      maskHorizon = event.messages.length;
+      persistState();
+    }
 
     const result = compressStaleToolResults(event.messages, maskOptions(contextUsage));
     if (result) recordMasks(result);
@@ -837,6 +956,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       rules: USER_RULES,
       placeholderFormat: activeProfile.placeholderFormat,
       maskOldThinking: activeProfile.maskOldThinking,
+      features: { maskArgs: features.maskArgs, collapseReads: features.collapseReads, batchInvalidation: features.batchInvalidation },
+      eventHorizon: maskHorizon,
     };
   }
 
@@ -976,6 +1097,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   function recordMasks(result: CompressResult): void {
     contextSaved += result.bytesSaved;
     contextMaskEvents++;
+    for (const id of result.maskedArgCalls) argsMaskedCalls.add(id);
+    for (const id of result.collapsedCalls) collapsedCalls.add(id);
     for (const p of result.maskedPaths) {
       if (!everMaskedReads.has(p)) {
         everMaskedReads.add(p);

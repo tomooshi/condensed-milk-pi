@@ -22,6 +22,7 @@ import {
   type RecallScan,
 } from "../filters/recall.js";
 import { indexSessionFile, locateSessionFile, readEntryAt } from "./session-file.js";
+import { argsText } from "../filters/args-mask.js";
 
 /** What one call did, for the opt-in telemetry in index.ts. */
 export interface RecallOutcome {
@@ -85,6 +86,15 @@ async function fileSource(session: string, sessionsDir: string): Promise<Built> 
   return { kind: "ok", source: { scan, sessionId: index.sessionId, fetch } };
 }
 
+/** argsText of one call in an assistant message (CM-ADR-005). The plan found
+ *  the call in this message, so a missing call is a broken invariant. */
+function callArgumentsText(message: any, toolCallId: string): string {
+  const call = (Array.isArray(message?.content) ? message.content : [])
+    .find((b: any) => b?.type === "toolCall" && (b.id ?? b.toolCallId) === toolCallId);
+  if (!call) throw new Error(`cm_recall: call ${toolCallId} was planned but is not in its message`);
+  return argsText(call.arguments ?? call.input);
+}
+
 const reply = (text: string, isError: boolean) => ({ content: [{ type: "text" as const, text }], details: undefined, isError });
 
 /** Run one recall request end to end and report the outcome. */
@@ -101,7 +111,7 @@ async function runRecall(request: RecallRequest, ctx: any, deps: RecallToolDeps)
   if (fetched.kind === "error") return failed(fetched.text);
   const rendered = renderRecall({
     record: plan.record,
-    text: toolResultText(fetched.message),
+    text: plan.record.kind === "args" ? callArgumentsText(fetched.message, plan.record.toolCallId) : toolResultText(fetched.message),
     raw: fetched.message?.details?.condensedMilk?.raw,
     request,
     bytesMax: recallBytesCap(deps.windowTokens(ctx)),

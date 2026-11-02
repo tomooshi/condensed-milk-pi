@@ -27,11 +27,13 @@ const bodyOf = (r) => { const t = textOfResult(r); return t.slice(t.indexOf("\n\
 // registration and explainer
 check("cm_recall is registered", tool?.name, "cm_recall");
 check("cm_recall parameters", Object.keys(tool.parameters.properties).sort(), ["grep", "id", "limit", "match", "offset", "raw", "session"]);
-const EXPLAINER = "\n\ncondensed-milk: old tool results can appear as `[cm-masked bash|read|recall #id] …`\n" +
-	"to keep the prompt cache stable. To see one exactly as it was first shown, call\n" +
-	"`cm_recall` with the id (add `grep`, or `offset`/`limit`, for part of it). To see the\n" +
-	"current state, re-run the command or re-read the file. Each costs one step, so do it\n" +
-	"only when the next step needs the content.";
+// test-edit: the explainer names masked arguments since 1.13.0 (CM-ADR-005).
+const EXPLAINER = "\n\ncondensed-milk: old tool results and long tool-call arguments can appear as\n" +
+	"`[cm-masked bash|read|recall|arg #id] …` to keep the prompt cache stable. To see one\n" +
+	"exactly as it was first shown, call `cm_recall` with the id (add `grep`, or\n" +
+	"`offset`/`limit`, for part of it). To see the current state, re-run the command or\n" +
+	"re-read the file. Each costs one step, so do it only when the next step needs the content.\n" +
+	"Never copy a placeholder into a new tool call.";
 check("explainer bytes", (await fire("before_agent_start", { systemPrompt: "BASE" }, makeCtx())).systemPrompt, "BASE" + EXPLAINER);
 
 // raw text in details

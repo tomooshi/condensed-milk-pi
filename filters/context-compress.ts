@@ -33,12 +33,20 @@
  * v1.11.0 (CM-ADR-001): placeholders carry `#<id>` (sha1 of the tool-call
  * id) so `cm_recall` can return the original; `cm_recall` results are
  * masked past the cutoff like bash results.
+ *
+ * v1.13.0 (CM-ADR-005): three changes that only move at mask events, each
+ * behind a feature flag: long edit/write/bash arguments are masked past the
+ * cutoff (C); superseded reads and duplicate results before the event horizon
+ * collapse (D); bash invalidation counts only commands before the event
+ * horizon (B1). `eventHorizon` is the message count at the last mask event.
  */
 
 import type { PlaceholderTemplates, ThinkingMaskPolicy } from "./profiles.js";
 import { renderPlaceholder, DEFAULT_PLACEHOLDERS } from "./profiles.js";
 import { countLines, formatSize, shortId } from "./text-metrics.js";
 import { recallLabel } from "./recall.js";
+import { argsId, maskArgs } from "./args-mask.js";
+import { collapsePlan, type CollapseEntry } from "./collapse.js";
 
 export { countLines, formatSize };
 
@@ -277,6 +285,10 @@ export interface CompressResult {
   messages: any[];
   bytesSaved: number;
   masksApplied: number;
+  /** v1.13.0: tool-call ids whose arguments were masked (C). */
+  maskedArgCalls: string[];
+  /** v1.13.0: tool-call ids of results collapsed by D. */
+  collapsedCalls: string[];
   /** The cutoff index used for this pass. Consumer persists this across
    *  calls so T doesn't regress. */
   cutoffIdx: number;
@@ -312,6 +324,18 @@ export interface CompressOptions {
    *  blocks on assistant messages. Defaults to "off" (Anthropic
    *  behavior). See profiles.ts for semantics. */
   maskOldThinking?: ThinkingMaskPolicy;
+  /** v1.13.0 (CM-ADR-005): changes that wait for mask events. Absent = off. */
+  features?: MaskFeatures;
+  /** v1.13.0: message count at the last mask event. D and B1 use only the
+   *  messages before it, so their bytes do not change between events. */
+  eventHorizon?: number;
+}
+
+/** v1.13.0 (CM-ADR-005) feature flags of the masker. */
+export interface MaskFeatures {
+  maskArgs?: boolean;
+  collapseReads?: boolean;
+  batchInvalidation?: boolean;
 }
 
 
@@ -391,16 +415,26 @@ export function compressStaleToolResults(
   opts: CompressOptions = {},
 ): CompressResult | null {
   const { cutoffIdx } = decideCutoff(messages.length, opts);
-  if (cutoffIdx <= 0) return null;
+  const features = opts.features ?? {};
+  const horizon = Math.min(Math.max(0, opts.eventHorizon ?? 0), messages.length);
+  // With D and B1 off this is 1.12.0's rule exactly: no cutoff, no masks.
+  const horizonWorks = horizon > 0 && (features.collapseReads === true || features.batchInvalidation === true);
+  if (cutoffIdx <= 0 && !horizonWorks) return null;
   if (cutoffIdx > messages.length) throw new Error("compressStaleToolResults: cutoff past the end of messages");
 
+  const toolCallIndex = buildToolCallIndex(messages);
   const scope: MaskScope = {
     messages,
     cutoffIdx,
     rules: opts.rules ?? DEFAULT_RULES,
-    templates: opts.placeholderFormat ?? DEFAULT_PLACEHOLDERS,
+    templates: { ...DEFAULT_PLACEHOLDERS, ...(opts.placeholderFormat ?? {}) },
     thinkingPolicy: opts.maskOldThinking ?? "off",
-    toolCallIndex: buildToolCallIndex(messages),
+    toolCallIndex,
+    features,
+    invalidationLimit: features.batchInvalidation ? horizon : messages.length,
+    collapse: features.collapseReads
+      ? collapsePlan(messages, horizon, (id) => toolCallIndex.get(id), { minChars: MIN_MASK_LENGTH, isPlaceholder: isAlreadyMasked })
+      : new Map(),
   };
   const outcomes = messages.map((m: any, idx: number) => maskMessage(m, idx, scope));
   if (outcomes.length !== messages.length) throw new Error("compressStaleToolResults: masking changed the message count");
@@ -414,6 +448,8 @@ export function compressStaleToolResults(
     cutoffIdx,
     maskedPaths: applied.flatMap((o) => (o.path ? [o.path] : [])),
     maskedCommands: applied.flatMap((o) => (o.command ? [o.command] : [])),
+    maskedArgCalls: applied.flatMap((o) => o.argCalls ?? []),
+    collapsedCalls: applied.flatMap((o) => (o.collapsedCall ? [o.collapsedCall] : [])),
   };
 }
 
@@ -425,6 +461,11 @@ interface MaskScope {
   templates: PlaceholderTemplates;
   thinkingPolicy: ThinkingMaskPolicy;
   toolCallIndex: Map<string, ToolCallEntry>;
+  features: MaskFeatures;
+  /** Invalidating commands count only below this index (B1: the horizon). */
+  invalidationLimit: number;
+  /** D: index -> why the result collapses (empty when D is off). */
+  collapse: Map<number, CollapseEntry>;
 }
 
 /** One message after masking. `bytesSaved` is null when nothing changed. */
@@ -433,6 +474,8 @@ interface MaskOutcome {
   bytesSaved: number | null;
   command?: string;
   path?: string;
+  argCalls?: string[];
+  collapsedCall?: string;
 }
 
 /** Decide and apply the mask for one message: a tool result (by tool kind)
@@ -447,17 +490,64 @@ function maskMessage(m: any, idx: number, scope: MaskScope): MaskOutcome {
     if (content.length < MIN_MASK_LENGTH) return unchanged;
     const target: MaskTarget = { m, msg, idx, content, pastCutoff };
     const vars = { id: shortId(String(msg.toolCallId ?? ""), msg.timestamp), n: countLines(content), size: formatSize(content.length) };
-    if (msg.toolName === "bash") return maskBash(target, vars, scope) ?? unchanged;
-    if (msg.toolName === "read") return maskRead(target, vars, scope) ?? unchanged;
+    if (msg.toolName === "bash") return maskBash(target, vars, scope) ?? maskCollapsed(target, vars, scope) ?? unchanged;
+    if (msg.toolName === "read") return maskRead(target, vars, scope) ?? maskCollapsed(target, vars, scope) ?? unchanged;
     if (msg.toolName === RECALL_TOOL_NAME) return maskRecall(target, vars, scope) ?? unchanged;
     return unchanged;
   }
-  // v1.10.0: thinking-block masking on assistant messages before the cutoff.
-  // The replacement is a deterministic empty string, so bytes stay
-  // identical turn-over-turn and the cache prefix is unaffected.
-  if (scope.thinkingPolicy === "off" || !pastCutoff) return unchanged;
-  const masked = maskAssistantThinking(m, scope.thinkingPolicy);
-  return masked.changed ? { message: masked.message, bytesSaved: masked.bytesSaved } : unchanged;
+  if (!pastCutoff || msg?.role !== "assistant") return unchanged;
+  return maskAssistant(m, scope) ?? unchanged;
+}
+
+/** An assistant message before the cutoff: long call arguments (C) and, by
+ *  profile, old thinking (v1.10.0). Both replacements are deterministic, so
+ *  the bytes stay identical turn-over-turn. */
+function maskAssistant(m: any, scope: MaskScope): MaskOutcome | null {
+  const args = scope.features.maskArgs ? maskCallArguments(m, scope) : null;
+  const base = args?.message ?? m;
+  const thinking = scope.thinkingPolicy === "off" ? null : maskAssistantThinking(base, scope.thinkingPolicy);
+  if (!args && !thinking?.changed) return null;
+  return {
+    message: thinking?.changed ? thinking.message : base,
+    bytesSaved: (args?.bytesSaved ?? 0) + (thinking?.changed ? thinking.bytesSaved : 0),
+    argCalls: args?.argCalls,
+  };
+}
+
+/** C: replace the long string arguments of edit/write/bash calls with
+ *  placeholders that carry the arguments id; reference paths stay. */
+function maskCallArguments(m: any, scope: MaskScope): MaskOutcome | null {
+  const msg = m?.message ?? m;
+  if (!Array.isArray(msg?.content)) return null;
+  let saved = 0;
+  const argCalls: string[] = [];
+  const content = msg.content.map((block: any) => {
+    if (block?.type !== "toolCall") return block;
+    const args = block.arguments ?? block.input;
+    if (typeof args?.path === "string" && isReferenceFile(args.path, scope.rules)) return block;
+    const id = argsId(String(block.id ?? block.toolCallId ?? ""), msg.timestamp);
+    const masked = maskArgs(String(block.name ?? ""), args, (cmd, vars) => renderPlaceholder(scope.templates.arg, { id, cmd, ...vars }));
+    if (!masked) return block;
+    saved += masked.saved;
+    argCalls.push(String(block.id ?? block.toolCallId));
+    return block.arguments !== undefined ? { ...block, arguments: masked.args } : { ...block, input: masked.args };
+  });
+  if (argCalls.length === 0) return null;
+  const updated = { ...msg, content };
+  return { message: m?.message ? { ...m, message: updated } : updated, bytesSaved: saved, argCalls };
+}
+
+/** D: a result that a newer one supersedes; the placeholder names the newer id. */
+function maskCollapsed(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): MaskOutcome | null {
+  const entry = scope.collapse.get(t.idx);
+  if (!entry) return null;
+  const newer = shortId(entry.newerToolCallId, entry.newerTimestamp);
+  const suffix = entry.reason === "same text" ? ` — same text as #${newer}` : ` — newer read #${newer}`;
+  const base = t.msg.toolName === "read"
+    ? renderPlaceholder(scope.templates.read, { ...vars, path: extractPath(t.msg, scope.toolCallIndex) })
+    : renderPlaceholder(scope.templates.bash, { ...vars, cmd: (extractCommand(t.msg, scope.toolCallIndex) || UNKNOWN_COMMAND).slice(0, PLACEHOLDER_COMMAND_CHARS_MAX) });
+  const outcome = applyMask(t.m, t.content, base + suffix, {});
+  return { ...outcome, collapsedCall: String(t.msg.toolCallId ?? "") };
 }
 
 /** One tool result that is long enough to mask. */
@@ -468,8 +558,8 @@ type PlaceholderVars = { id: string; n: number; size: string };
  *  cwd invalidates it (ADR-024). */
 function maskBash(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): MaskOutcome | null {
   const command = extractCommand(t.msg, scope.toolCallIndex);
-  const invalidated = !t.pastCutoff && command !== "" &&
-    isCommandInvalidated(command, scope.messages, t.idx, scope.toolCallIndex, scope.rules);
+  const invalidated = !t.pastCutoff && command !== "" && t.idx < scope.invalidationLimit &&
+    isCommandInvalidated(command, scope.messages, t.idx, scope.toolCallIndex, scope.rules, scope.invalidationLimit);
   if (!t.pastCutoff && !invalidated) return null;
   const cmd = command ? command.slice(0, PLACEHOLDER_COMMAND_CHARS_MAX) : UNKNOWN_COMMAND;
   return applyMask(t.m, t.content, renderPlaceholder(scope.templates.bash, { ...vars, cmd }), { command: command || undefined });
@@ -500,7 +590,7 @@ function applyMask(m: any, content: string, placeholder: string, what: { command
  *  the model). `cwd` is parsed from a `cd X && ` prefix and used for
  *  invalidation scoping. `recallLabel` is set for cm_recall calls.
  *  Handles live + persisted shapes. */
-type ToolCallEntry = { command?: string; path?: string; cwd?: string; recallLabel?: string };
+type ToolCallEntry = { command?: string; path?: string; offset?: unknown; limit?: unknown; cwd?: string; recallLabel?: string };
 function buildToolCallIndex(messages: any[]): Map<string, ToolCallEntry> {
   const calls = messages
     .map((m: any) => m?.message ?? m)
@@ -512,6 +602,8 @@ function buildToolCallIndex(messages: any[]): Map<string, ToolCallEntry> {
     const entry: ToolCallEntry = {
       command: rawCmd,
       path: typeof args.path === "string" ? args.path : undefined,
+      offset: args.offset,
+      limit: args.limit,
       cwd: rawCmd ? parseCdPrefix(rawCmd).cwd : undefined,
       recallLabel: block.name === RECALL_TOOL_NAME ? recallLabel(args) : undefined,
     };
@@ -533,11 +625,13 @@ function isCommandInvalidated(
   fromIdx: number,
   toolCallIndex: Map<string, ToolCallEntry>,
   rules: ResolvedRules,
+  limit: number,
 ): boolean {
   const self = parseCdPrefix(command);
   const applicable = rules.invalidationRules.filter((r) => r.invalidated.test(self.cmd));
   if (applicable.length === 0) return false;
-  for (let i = fromIdx + 1; i < messages.length; i++) {
+  // Bounded by the message list; B1 (v1.13.0) lowers `limit` to the event horizon.
+  for (let i = fromIdx + 1; i < Math.min(limit, messages.length); i++) {
     const later = messages[i]?.message ?? messages[i];
     if (!isBashToolResult(later)) continue;
     const laterRaw = extractCommand(later, toolCallIndex);

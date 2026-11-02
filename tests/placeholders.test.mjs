@@ -96,6 +96,8 @@ const ALL_MASKED = { previousCutoff: 1_000, zoneEntered: 2, contextUsage: 0.9 };
 		bash: "[cm-masked bash #{id}] {cmd} ({n} lines, {size})",
 		read: "[cm-masked read #{id}] {path} ({n} lines, {size})",
 		recall: "[cm-masked recall #{id}] {cmd} ({n} lines, {size})",
+		// test-edit: CM-ADR-005 adds the arguments kind (1.13.0).
+		arg: "[cm-masked arg #{id}] {cmd} ({n} lines, {size})",
 	};
 	check("default profile templates", profiles.BUILT_IN_PROFILES.default.placeholderFormat, want);
 	check("qwen-vllm profile templates", profiles.BUILT_IN_PROFILES["qwen-vllm"].placeholderFormat, want);

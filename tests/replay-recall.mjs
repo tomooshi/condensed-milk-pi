@@ -30,6 +30,7 @@ const V110 = { bash: "[cm-masked bash] {cmd}", read: "[cm-masked read] {path} ({
 const { loadTs } = await import("./harness.mjs");
 const cc = await loadTs("filters/context-compress.ts");
 const R = await loadTs("filters/recall.ts");
+const AM = await loadTs("filters/args-mask.ts");
 
 function newestSessions() {
 	const files = readdirSync(SESSIONS_DIR, { withFileTypes: true })
@@ -69,6 +70,60 @@ let newBytesSum = 0;
 let failures = 0;
 let totalChecked = 0;
 let skipped = 0;
+let argsChecked = 0;
+
+/** 1.13.0 gate C (docs §6.1): with masked arguments on, every masked call's
+ *  id resolves to an arguments record, the recalled text is argsText of the
+ *  call's original arguments, and argsText parses back to them exactly. */
+function checkArgs(messages, branch, scan, byEntry) {
+	const out = cc.compressStaleToolResults(messages, { ...opts(messages), features: { maskArgs: true } })?.messages ?? messages;
+	let checked = 0;
+	let bad = 0;
+	out.forEach((m, i) => {
+		if (m.role !== "assistant" || m === messages[i]) return;
+		for (const [j, block] of (m.content ?? []).entries()) {
+			const original = messages[i].content[j];
+			if (block?.type !== "toolCall" || JSON.stringify(block.arguments) === JSON.stringify(original.arguments)) continue;
+			checked++;
+			const id = /\[cm-masked arg #([0-9a-f]{10})\]/.exec(JSON.stringify(block.arguments))?.[1];
+			if (id !== AM.argsId(original.id, messages[i].timestamp)) { bad++; continue; }
+			const plan = R.planRecall(scan.records, { id }, scan);
+			if (plan.kind !== "fetch" || plan.record.kind !== "args") { bad++; continue; }
+			const call = byEntry.get(plan.record.entryId).message.content.find((c) => c?.type === "toolCall" && c.id === plan.record.toolCallId);
+			const text = AM.argsText(call.arguments);
+			if (text !== AM.argsText(original.arguments) || JSON.stringify(parseArgsText(text)) !== JSON.stringify(original.arguments)) bad++;
+		}
+	});
+	return { checked, bad };
+}
+
+/** Same parser as tests/args-mask.test.mjs. */
+function parseArgsText(text) {
+	const out = {};
+	const lines = text.split("\n");
+	const set = (key, value) => {
+		const parts = key.match(/[^.[\]]+|\[\d+\]/g);
+		let node = out;
+		parts.forEach((p, i) => {
+			const k = p.startsWith("[") ? Number(p.slice(1, -1)) : p;
+			if (i === parts.length - 1) { node[k] = value; return; }
+			if (node[k] === undefined) node[k] = parts[i + 1].startsWith("[") ? [] : {};
+			node = node[k];
+		});
+	};
+	for (let i = 0; i < lines.length; i++) {
+		const section = /^--- (.+) \((\d+) lines\) ---$/.exec(lines[i]);
+		if (section) {
+			const n = Number(section[2]);
+			set(section[1], lines.slice(i + 1, i + 1 + n).join("\n"));
+			i += n;
+			continue;
+		}
+		const scalar = /^(.+?): (.*)$/.exec(lines[i]);
+		if (scalar) set(scalar[1], JSON.parse(scalar[2]));
+	}
+	return out;
+}
 for (const { path, stat } of newestSessions()) {
 	if (stat.size > MAX_MB * 1024 * 1024) { skipped++; continue; }
 	const branch = await readBranch(path);
@@ -94,6 +149,10 @@ for (const { path, stat } of newestSessions()) {
 		const body = out.text.slice(out.text.indexOf("\n\n") + 2);
 		if (body !== R.toolResultText(original)) bad++;
 	});
+	const args = checkArgs(messages, branch, scan, byEntry);
+	checked += args.checked;
+	bad += args.bad;
+	argsChecked += args.checked;
 	const old = cc.compressStaleToolResults(messages, { ...opts(messages), placeholderFormat: V110 });
 	const oldBytes = JSON.stringify(old?.messages ?? messages).length;
 	const growth = (JSON.stringify(first?.messages ?? messages).length - oldBytes) / oldBytes;
@@ -106,7 +165,7 @@ for (const { path, stat } of newestSessions()) {
 }
 growths.sort((a, b) => a - b);
 const pct = (q) => (growths[Math.min(growths.length - 1, Math.floor(q * growths.length))] * 100).toFixed(3);
-console.log(`\nsessions=${growths.length} skipped_over_${MAX_MB}MB=${skipped} placeholders_checked=${totalChecked} failures=${failures}`);
+console.log(`\nsessions=${growths.length} skipped_over_${MAX_MB}MB=${skipped} placeholders_checked=${totalChecked} (of which masked calls ${argsChecked}) failures=${failures}`);
 console.log(`growth vs v1.10 placeholders: median ${pct(0.5)}%, p90 ${pct(0.9)}%, max ${pct(1)}%`);
 // Size-weighted: cost follows bytes, so long sessions count for more.
 console.log(`size-weighted growth: ${(((newBytesSum - oldBytesSum) / oldBytesSum) * 100).toFixed(3)}% of ${(oldBytesSum / 1e6).toFixed(0)} MB masked history`);

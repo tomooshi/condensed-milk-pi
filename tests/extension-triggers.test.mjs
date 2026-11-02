@@ -109,8 +109,8 @@ async function pass(fire, messages, ctxOpts = {}) {
 	delete process.env.CONDENSED_MILK_TELEMETRY;
 	const lines = readFileSync(join(home, ".config", "condensed-milk-sessions.jsonl"), "utf-8").trim().split("\n");
 	const entry = JSON.parse(lines.at(-1));
-	check("telemetry schema", entry.schema, 3); // test-edit: schema 3 since 1.12.0 (CM-ADR-004)
-	check("telemetry version", entry.version, "1.12.0");
+	check("telemetry schema", entry.schema, 4); // test-edit: schema 4 since 1.13.0 (CM-ADR-007)
+	check("telemetry version", entry.version, "1.13.0");
 	check("recall counters", [entry.recalls_by_id, entry.recalls_by_match, entry.recall_errors, entry.recall_then_rerun], [1, 0, 1, 1]);
 	check("boundary counters", [entry.boundaries_applied, entry.boundaries_skipped, entry.idle_advances], [1, 0, 0]);
 	check("bytes returned is counted", entry.recall_bytes_returned > 5_000, true);

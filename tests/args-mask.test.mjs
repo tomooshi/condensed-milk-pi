@@ -68,7 +68,7 @@ const history = () => [
 {
 	const msgs = [userMsg("go"), assistantCall("bash:0", "write", { path: "/r/x", content: LONG }, 1_000), toolResult("bash:0", "write", "ok"), userMsg("n")];
 	const out = cc.compressStaleToolResults(msgs, opts(3)).messages;
-	check("the arguments id uses the assistant timestamp", callArgs(out[1]).content.slice(0, 30), `[cm-masked arg #${aid("bash:0", 1_000)}]`);
+	check("the arguments id uses the assistant timestamp", callArgs(out[1]).content.slice(0, 27), `[cm-masked arg #${aid("bash:0", 1_000)}]`);
 }
 
 // maskable leaves

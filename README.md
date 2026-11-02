@@ -97,6 +97,32 @@ Besides the pressure zones, two events move the cutoff. Each applies only when i
 
 **Measured result** on a 926-message real session at defaults: 42 cache variants, static cutoff yields ~$0.10 vs ≈$0.19 with no cache — ≈47% cost reduction, and prefix stays stable across full session length.
 
+### Masked tool-call arguments and batched invalidation (v1.13.0, CM-ADR-005)
+
+An edit or write call carries the whole text it changes, and a heredoc bash call carries the whole script. After the
+call ran, the file holds that text, yet every later request sent it again. In 1.13.0, past the cutoff:
+
+- each string argument of an edit or write call of 240+ characters, and a bash command of 2,048+ characters,
+  becomes `[cm-masked arg #3f9a2c1d7e] edit edits[0].oldText (81 lines, 3.2KB)`. `path` and short values stay;
+  reference files stay. `cm_recall` with the id returns the arguments byte-identical.
+- bash invalidation (the built-in `git add` → `git status` rules, or your own) waits for the next mask event
+  instead of editing the prompt mid-run.
+
+Both change bytes only at mask events, which already rewrite the cache. Measured on 30 days of real sessions
+(38 sessions, 51,472 calls, replayed against 1.12.0): cost -11.9% [-21%, -5%] at Opus 5.5 cache prices, cache writes
+-6.9%, recall byte-identical for all 8,314 masked calls, accepted by Anthropic, OpenRouter and vLLM. The cost: about
+2-4% more of the model's earlier thinking blocks are invalidated, because a mask event now also edits older calls.
+To turn either off, add `"features": {"maskArgs": false}` or `{"batchInvalidation": false}` to
+`~/.config/condensed-milk.json`. Gates and raw numbers: `docs/research/2026-11-02-next-features.md` §12.
+
+**Live A/B (CM-ADR-006).** `"experiment": {"ab": true}` in `~/.config/condensed-milk.json` gives each session a fixed
+arm from its id: `control` (1.12.0 behavior) or `treatment`. Telemetry schema 4 records the arm and quality counts
+(turns per prompt, failed edits, tool errors), so the two arms can be compared after a few weeks.
+
+**About `boundaryCommands`.** The replay found that a `bd close` boundary saves about $49 a month but costs about
+700 invalidated thinking blocks and 30 extra re-fetches of identical output. The default stays empty; add it only if
+you prefer the saving.
+
 ### Prefix guard (v1.12.0, CM-ADR-004)
 
 Every provider request is compared with the previous one, in the order a prompt cache reads it: tools, then system,
@@ -193,7 +219,9 @@ Controls when and how aggressively masking fires. Single source of truth for cac
   "thresholds": [0.30, 0.45, 0.60],
   "coverage":   [0.60, 0.80, 0.95],
   "showStatus": true,
-  "cacheTtlSeconds": 3600
+  "cacheTtlSeconds": 3600,
+  "features": { "maskArgs": true, "batchInvalidation": true },
+  "experiment": { "ab": false }
 }
 ```
 
@@ -205,6 +233,8 @@ v1.8.0 auto-migrates configs matching any recognized prior default tuple (e.g. v
 | `coverage` | Fraction of messages masked when each threshold fires. Same length as `thresholds`. |
 | `showStatus` | Publish `↓N (Cf)` token-savings indicator to the pi status bar. Default `true`. Orthogonal to compression — only controls the footer. |
 | `cacheTtlSeconds` | v1.11.0: prompt-cache lifetime for the idle trigger. Optional: by default the model's `promptCache` tier is used (`PI_CACHE_RETENTION=long` → long). |
+| `features` | v1.13.0: `maskArgs` (mask long edit/write arguments and long bash commands past the cutoff) and `batchInvalidation` (invalidation waits for mask events). Both default `true`. |
+| `experiment.ab` | v1.13.0: `true` assigns each session to a control or treatment arm (CM-ADR-006). Default off. |
 
 Also editable via `/compress-config`. Changes take effect on next session.
 
@@ -299,7 +329,10 @@ type, mask statistics, thresholds and coverage in use, cache hit rate, total
 tokens by bucket, condensed-milk version, and sha256-truncated (16-char) hashes
 of the session path and cwd. Schema 2 (v1.11.0) adds `cm_recall` counts (by id,
 by match, errors, bytes returned, turns ago, re-runs after a recall),
-task-boundary and idle trigger counts, and context-usage read failures.
+task-boundary and idle trigger counts, and context-usage read failures. Schema 3
+(v1.12.0) adds prefix-guard counts. Schema 4 (v1.13.0) adds the A/B arm, the
+feature flags, user prompts, tool results, tool errors, failed edits ("could
+not find") and masked-argument counts.
 
 **What's NOT recorded:** any message or tool output content, file paths,
 commands, tool inputs or `cm_recall` arguments (only hashes), environment

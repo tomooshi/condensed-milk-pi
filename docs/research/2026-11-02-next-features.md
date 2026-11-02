@@ -572,3 +572,52 @@ measured, before any of the code exists. A feature that fails a gate does not sh
   tool errors and tool results.
 - Live gates are read after at least 14 days and at least 30 sessions per arm. A failed live gate turns the feature
   off by default in the next release.
+
+## 12. Release 1.13.0: gate results (2026-11-02)
+
+Offline: 38 sessions, 51,472 calls, 30 days; arm minus 1.12.0, paired by session, 95% bootstrap CI (10,000
+resamples, seed 20261102); harness gate PASS on the held-out sessions (-4.9%, 6.2%, Spearman 1.000). Costs at
+claude-opus-5-5 cache prices. Probes: `bench/probe/features.sh`. Raw outputs: `/tmp/cm-bench/v113/run{1,2,3}.json`,
+`/tmp/cm-probe113*/` (not kept in the repo).
+
+### 12.1 Results
+
+| Item | Gate | Result | Verdict |
+|---|---|---|---|
+| A/A | 1.13.0 with every feature off equals 1.12.0 | Every difference exactly 0 (run 1) | Pass |
+| C | Re-read down >= 0.8B, CI excludes 0 | -2,929M [-5,438, -1,111] | Pass |
+| C | Extra cache writes <= +5% | -6.9% | Pass |
+| C | Recall byte-identical in 100% | 8,314 masked calls in 40 real sessions, 0 failures | Pass |
+| C | Accepted by Anthropic OAuth, OpenRouter, vLLM | 3 of 3 (Opus 5.5; openai/gpt-4.1-mini; Qwen2.5-1.5B-Instruct on vLLM CPU) | Pass |
+| D | Re-read down >= 0.25B, CI excludes 0 | -211M [-419, -45] | **Fail** |
+| D | Probe accepted (1 run) | Accepted (Anthropic, OpenRouter, vLLM) | Pass |
+| B1 | Invalidation-caused rewrites down >= 50% | 1.12.0: 163 (757 - 594); B1: -8 (586 - 594), so all of them | Pass |
+| B1 | Drops after an invalidation not above base | -594 [-1,151, -167] | Pass |
+| B1 | 0 drops at the invalidation point, 3 of 3 probe runs | 0, 0, 0; the 1.12.0 control run dropped 1 | Pass |
+| R | Thinking invalidated down, CI below zero | -7,462 [-13,689, -2,837] | Pass |
+| R | Cost <= +1% (point), <= +2% (CI upper) | +$1,119 [348, 2,075], +17% | **Fail** |
+
+Shipped in 1.13.0: C and B1, on by default. D and R are removed (code kept in commit db5746e).
+
+### 12.2 What the release does to cost and reasoning (30 days)
+
+| Setup | Cost | Cache writes | Thinking blocks invalidated by edits |
+|---|---|---|---|
+| Operator config (no invalidation rules, so only C acts) | -$767 [-1,364, -304] (-11.9%) | -6.9% | +865 [347, 1,525] (+4.1%) |
+| Default rules (C and B1) | -$773 [-1,372, -308] | -8.3% | +424 [107, 846] (+2.0%) |
+| B1 alone, default rules | +$4 [-7, 15] | -0.4% | -594 [-1,151, -167] (-2.8%) |
+
+Why C costs reasoning: a mask event that found no new result to mask was a no-op before; with C it also masks the
+arguments of older calls, so it edits the prefix (+157 [63, 289] edit events) and invalidates the thinking blocks
+after the edit. C's live gates (turns per prompt, failed edits) decide whether that loss shows in the work.
+
+### 12.3 Findings for later
+
+- **Restarts decide a third of the lost reasoning.** R shows that the re-mask after a pi restart invalidates 7,462
+  thinking blocks in 30 days and saves $1,119. Keeping the reasoning is a valid choice for a user who values it over
+  money; a `features.persistCutoff` option could return as an opt-in, with its own gates.
+- **D is small next to the cutoff.** The upper bound of §2.4 counted superseded reads that 1.11 left live; the
+  exact-range rule and the event horizon leave 0.21B. A path-only rule (any newer read of the path) would catch
+  more but can hide a range the agent still needs.
+- **Live gates** run after the release: set `"experiment": {"ab": true}` (CM-ADR-006) and read schema-4 telemetry
+  after at least 14 days and 30 sessions per arm.

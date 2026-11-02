@@ -2,6 +2,53 @@
 
 All notable changes to condensed-milk.
 
+## [1.13.0] - 2026-11-02
+
+Five candidates were built and tested against gates fixed before the build
+(`docs/research/2026-11-02-next-features.md` §6.1, §11). Two passed and ship, on by default. Two failed and
+were removed. Results: §12.
+
+### Added — masked tool-call arguments (CM-ADR-005, option C)
+
+- Past the cutoff, each string argument of an edit or write call of 240+ characters, and each bash command of
+  2,048+ characters, becomes `[cm-masked arg #id] <tool> <key> (<n> lines, <size>)`. `path` and short values stay,
+  and reference files are never masked. `cm_recall` with the id returns the arguments byte-identical.
+- Measured (30 days, 38 sessions, 51,472 calls, against 1.12.0): re-read tokens -2,929M [-5,438, -1,111], cost
+  -$767 [-1,364, -304] (-11.9%) at Opus 5.5 cache prices, cache writes -6.9%. Recall byte-identical for all 8,314
+  masked calls in 40 real sessions. Accepted by Anthropic OAuth, OpenRouter and vLLM.
+- Trade-off: thinking blocks invalidated +4.1% [+1.6%, +7.2%], because a mask event now also edits older calls.
+
+### Added — batched invalidation (CM-ADR-005, option B1)
+
+- Bash invalidation (built-in `git` rules or your own) now waits for the next mask event instead of editing the
+  prompt mid-run. With default rules: invalidation-caused rewrites 163 → 0, thinking blocks invalidated -594
+  [-1,151, -167], cost unchanged (+$4 [-7, 15]). Probe: 0 thinking drops at the invalidation point in 3 of 3
+  runs; the 1.12.0 control dropped 1.
+
+### Added — live A/B switch and telemetry schema 4 (CM-ADR-006)
+
+- `"experiment": {"ab": true}` assigns each session to control (1.12.0 behavior) or treatment by its session id.
+- Schema 4 adds the arm, the feature flags, user prompts, tool results, tool errors, failed edits and the
+  masked-argument count, for the live gates (turns per prompt, failed edits, recall then re-run, tool errors).
+
+### Changed
+
+- The system-prompt explainer names masked arguments and says "Never copy a placeholder into a new tool call."
+  New explainer and placeholder kind: one cache miss per session after the update.
+- `features.maskArgs` / `features.batchInvalidation` in `~/.config/condensed-milk.json` turn each feature off.
+
+### Not adopted
+
+- Collapse of superseded and duplicate results (D): -211M re-read tokens, below its 250M gate.
+- Keeping the cutoff across a pi restart (R): -7,462 invalidated thinking blocks, but +17% cost against a 1% gate.
+- Both are kept in commit db5746e for a later retry.
+
+### Tests and tools
+
+- 20 test files pass; new spec tests were written first and proven red. `bench/replay-cost.mjs` now counts
+  characters removed from assistant messages. `bench/probe/features.sh` runs the probe gates against Anthropic,
+  OpenRouter or a local vLLM server.
+
 ## [1.12.0] - 2026-11-02
 
 ### Added — prefix guard (CM-ADR-004)

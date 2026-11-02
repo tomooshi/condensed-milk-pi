@@ -1,0 +1,99 @@
+# Publish to npm through trusted publishing (OIDC): no npm token exists, and
+# npm adds a provenance attestation. npm accepts publishes only from this
+# file in tomooshi/condensed-milk-pi (configured on npmjs.com).
+#
+# Triggers: pushing a version tag (v1.12.0), or "Run workflow" with an
+# existing tag, for a tag that was pushed before this workflow existed.
+#
+# Two jobs on purpose: `test` installs third-party test tools but cannot
+# publish; `publish` can mint the OIDC token but installs nothing, so no
+# package code runs next to the publish credential.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, for example v1.11.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: The tag must match package.json
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          version="v$(node -p 'require("./package.json").version')"
+          if [ "$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match package.json version $version"
+            exit 1
+          fi
+
+      # The extension has no runtime dependencies. The tests load the
+      # TypeScript sources through jiti (the loader pi uses), alias
+      # @earendil-works/pi-ai, and two legacy tests call tsx and tsc.
+      # Exact versions, no lockfile written, no install scripts run.
+      - name: Install pinned test tools
+        run: >
+          npm install --no-save --no-package-lock --ignore-scripts --no-audit --no-fund
+          jiti@2.7.0 @earendil-works/pi-ai@1.0.4 tsx@4.23.15 typescript@5.9.3
+
+      - name: Run all tests
+        env:
+          CM_JITI: ${{ github.workspace }}/node_modules/jiti/lib/jiti.mjs
+        run: node tests/run.mjs
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # OIDC token for npm trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+
+      # Node 24 ships npm 11; trusted publishing needs npm 11.5.1 or later.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: npm must support trusted publishing
+        run: |
+          node -e '
+            const v = process.argv[1].split(".").map(Number);
+            const ok = v[0] > 11 || (v[0] === 11 && (v[1] > 5 || (v[1] === 5 && v[2] >= 1)));
+            if (!ok) { console.error("npm " + process.argv[1] + " is older than 11.5.1"); process.exit(1); }
+            console.log("npm " + process.argv[1] + " supports trusted publishing");
+          ' "$(npm --version)"
+
+      - name: Publish
+        run: npm publish --access public

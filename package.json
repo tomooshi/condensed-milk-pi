@@ -7,7 +7,7 @@
   "main": "index.ts",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tomooshi/condensed-milk-pi.git"
+    "url": "git+https://github.com/tomooshi/condensed-milk-pi.git"
   },
   "bugs": {
     "url": "https://github.com/tomooshi/condensed-milk-pi/issues"

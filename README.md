@@ -541,6 +541,11 @@ Token Compressor Stats
 
 The context retroactive compression is the dominant savings — **1.4MB in one session** from compressing stale file reads and old command outputs.
 
+## Development and releases
+
+- Tests: `node tests/run.mjs` runs every test file. The tests load the TypeScript sources through jiti, the loader pi uses. Outside a pi install, set `CM_JITI` to `node_modules/jiti/lib/jiti.mjs` after `npm install --no-save jiti @earendil-works/pi-ai tsx typescript`. `node tests/replay-recall.mjs` checks recall against your own pi sessions.
+- Releases go to npm from GitHub Actions through trusted publishing (`.github/workflows/publish.yml`): no npm token exists, and every version carries a provenance attestation. Pushing a tag `vX.Y.Z` that matches `package.json` runs the tests and publishes. Check a release with `npm audit signatures` or on the npm package page.
+
 ## License
 
 MIT

@@ -418,3 +418,32 @@ Not tested: Claude Code on this machine is 2.1.105 (OpenCode requires 2.1.248 or
 rejected with 401, so a test needs `claude auth login` and an update first.
 Sources: Earendil README and ARCHITECTURE.md; OpenCode `claude-agent.mdx`; The New Stack, "Anthropic pauses
 Claude Agent SDK subscription change" (2026-06-16); @opencode on X, 2026-10-30.
+
+### 8.10 Earendil provider against the current setup (gates set before the runs)
+
+Setup: isolated pi (`-ne` + MCP + codemode + condensed-milk 1.11.1) with either `pi-claude-code-use` 2.2.1
+(current, `anthropic/claude-opus-5-5`) or a test copy of `earendil-works/pi-claude-code` at `70abb65`
+(`claude-code/claude-opus-5-5`, Claude Code 2.1.316, Max plan). The test copy only adds logging to the relay:
+hashes of `system`, `tools` and each message, the message shapes, and Anthropic's `input_transformations`.
+
+| Gate | Result | Verdict |
+|---|---|---|
+| G1 Plan only | `isUsingOverage: false` on every turn; overage `rejected` (`out_of_credits`); weekly utilization 0.78 (`allowed_warning`) | Pass |
+| G2 Late tools | `tools` fixed at 7 entries with one hash in 6 of 6 runs; MCP resource tools never declared; no failing block reported | Pass |
+| G3 Cache | Median cache-read share 91.6% against 96.3% (within 5 points); writes after a mask equal (313 against 330 tokens) | Pass, narrowly |
+| G4 condensed-milk | The mask applied (52,576 bytes to a 131-byte placeholder), `cm_recall` found the masked result, 3 of 3 runs | Pass |
+| G5 Speed | Four-step probe median 13.9 s against 13.2 s (1.05x); mask-and-tools test 21-22 s against 21.4 s | Pass |
+| G6 Tools | bash, read, edit, write and `cm_recall` worked; files changed as asked, 4 of 4 runs | Pass |
+
+Main difference found: on the Earendil path the request history never contains earlier thinking blocks. Claude
+Code sends `context_management: {edits: [{type: "clear_thinking_20251015", keep: "all"}]}` with
+`thinking: {type: "adaptive"}` and no `block_binding`, but replays earlier assistant turns as text and tool calls
+only (relay shapes `a:U`, `a:t`), although pi stores them with thinking and Earendil's transcript code would pass
+signed blocks. So the model always starts each call without its earlier reasoning, and condensed-milk edits cannot
+invalidate thinking. On the current setup, earlier thinking is kept until an edit drops it (1 block dropped at the
+mask in 2 of 2 runs). Output tokens per probe run were similar (362-527 against 478-508).
+
+Consequences for condensed-milk if the operator switches: options B1 and B2 lose their purpose (no thinking to
+protect, and B2 cannot be injected); the prefix guard (A) must read response usage, because pi's
+`before_provider_request` never sees Claude Code's request; C and D work unchanged, because they act in pi's
+`context` event.

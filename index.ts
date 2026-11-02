@@ -54,6 +54,7 @@ import {
   passesMinBytes,
 } from "./filters/triggers.js";
 import { createRecallTool, type RecallOutcome } from "./io/recall-tool.js";
+import { comparePayloads, type PrefixChange } from "./filters/prefix-guard.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 import {
   resolveProfile,
@@ -112,8 +113,9 @@ const CONFIG_PATH = join(homedir(), ".config", "condensed-milk.json");
 // Path is separate from CONFIG_PATH so deleting one doesn't disturb the other.
 const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.jsonl");
 // v1.11.0: schema 2 adds recall and trigger counters (CM-ADR-002 §7).
-const TELEMETRY_SCHEMA_VERSION = 2;
-const PACKAGE_VERSION = "1.11.1";
+// v1.12.0: schema 3 adds prefix-guard counters (CM-ADR-004).
+const TELEMETRY_SCHEMA_VERSION = 3;
+const PACKAGE_VERSION = "1.12.0";
 
 /** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
  *  extension (e.g. user-installed third-party tools with identifying names)
@@ -536,6 +538,16 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         idle_advances: triggerStats.idle_advances,
         idle_skipped: triggerStats.idle_skipped,
         usage_read_failures: usageReadFailures,
+        // v1.12.0 schema 3 (CM-ADR-004)
+        prefix_edits_tools: guard.tools,
+        prefix_edits_system: guard.system,
+        prefix_edits_messages: guard.messages,
+        prefix_edits_cm_mask: guard.cmMask,
+        prefix_edits_removed: guard.removed,
+        thinking_at_risk: guard.thinkingAtRisk,
+        thinking_dropped_after_edit: guard.droppedAfterEdit,
+        cache_write_after_edit: guard.cacheWriteAfterEdit,
+        prefix_guard_failures: guard.failures,
       };
       mkdirSync(dirname(TELEMETRY_LOG_PATH), { recursive: true });
       appendFileSync(TELEMETRY_LOG_PATH, JSON.stringify(entry) + "\n");
@@ -559,7 +571,78 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   /** `bash:<command>` / `read:<path>` keys of recalled results, oldest first. */
   const recalledKeys = new Set<string>();
 
+  // v1.12.0 (CM-ADR-004): prefix guard. Observes each provider request and
+  // never changes it; the response then tells what the change cost.
+  const guard = {
+    tools: 0, system: 0, messages: 0, cmMask: 0, removed: 0,
+    thinkingAtRisk: 0, droppedAfterEdit: 0, cacheWriteAfterEdit: 0, failures: 0,
+  };
+  let guardPrevPayload: unknown = null;
+  let guardPendingEdit = false;
+  let guardLastEdit: PrefixChange | null = null;
+  let guardPrevDrops = new Set<string>();
+
+  function resetGuard(): void {
+    for (const key of Object.keys(guard) as (keyof typeof guard)[]) guard[key] = 0;
+    guardPrevPayload = null;
+    guardPendingEdit = false;
+    guardLastEdit = null;
+    guardPrevDrops = new Set();
+  }
+
+  /** Count one request's prefix change and log it when CM_PREFIX_GUARD_LOG is set. */
+  function recordPrefixChange(change: PrefixChange): void {
+    if (change.kind === "none" || change.kind === "first" || change.kind === "unsupported") return;
+    if (change.kind === "tools") guard.tools++;
+    if (change.kind === "system") guard.system++;
+    if (change.kind === "message") guard.messages++;
+    if (change.kind === "message" && change.detail === "condensed-milk mask") guard.cmMask++;
+    if (change.kind === "removed") guard.removed++;
+    guard.thinkingAtRisk += change.thinkingAfter;
+    guardPendingEdit = true;
+    guardLastEdit = change;
+    const logPath = process.env.CM_PREFIX_GUARD_LOG;
+    if (logPath) appendFileSync(logPath, JSON.stringify(change) + "\n");
+  }
+
+  pi.on("before_provider_request", (event) => {
+    try {
+      const payload = (event as { payload?: unknown }).payload;
+      const change = comparePayloads(guardPrevPayload, payload);
+      if (change.kind !== "unsupported") guardPrevPayload = payload;
+      recordPrefixChange(change);
+    } catch (e) {
+      // Observation may fail (CONVENTIONS loop-bounded-observation); the
+      // request must still go out unchanged. Counted and reported once.
+      if (guard.failures++ === 0) process.stderr.write(`condensed-milk prefix guard: ${(e as Error).message}\n`);
+    }
+    return undefined;
+  });
+
+  pi.on("message_end", (event) => {
+    const message = (event as { message?: any }).message;
+    if (message?.role !== "assistant" || !message.usage) return undefined;
+    const drops = new Set<string>();
+    for (const d of message.diagnostics ?? []) {
+      for (const t of d?.details?.transformations ?? []) if (t?.type === "thinking_dropped") drops.add(String(t.path).split(".content")[0]);
+    }
+    if (guardPendingEdit) {
+      guard.cacheWriteAfterEdit += message.usage.cacheWrite ?? 0;
+      guard.droppedAfterEdit += [...drops].filter((p) => !guardPrevDrops.has(p)).length;
+      guardPendingEdit = false;
+    }
+    guardPrevDrops = drops;
+    return undefined;
+  });
+
+  function describeEdit(change: PrefixChange | null): string {
+    if (!change) return "none";
+    const where = (change.kind === "message" || change.kind === "removed") && change.index !== null ? ` ${change.index}` : "";
+    return `${change.kind}${where}: ${change.detail}`;
+  }
+
   function resetRecallAndTriggerStats(): void {
+    resetGuard();
     boundaryPending = false;
     idleHandledTouchMs = undefined;
     usageReadFailures = 0;
@@ -981,6 +1064,12 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  With grep: ${recallStats.with_grep} | raw: ${recallStats.with_raw} | other session: ${recallStats.cross_session}`,
         `  Bytes returned: ${formatBytes(recallStats.bytes_returned)} | avg turns ago: ${recallStats.by_id > 0 ? (recallStats.turns_ago_sum / recallStats.by_id).toFixed(1) : "—"}`,
         `  Recall then re-run: ${recallStats.then_rerun}`,
+        "",
+        "Prefix guard (v1.12.0)",
+        `  Prefix edits: tools ${guard.tools}, system ${guard.system}, messages ${guard.messages} (condensed-milk masks ${guard.cmMask}), removed ${guard.removed}`,
+        `  Thinking blocks at risk: ${guard.thinkingAtRisk} | dropped by Anthropic after an edit: ${guard.droppedAfterEdit}`,
+        `  Cache written right after an edit: ${guard.cacheWriteAfterEdit} tokens`,
+        `  Last edit: ${describeEdit(guardLastEdit)}`,
         "",
         "Triggers (v1.11.0)",
         `  Task boundaries: ${triggerStats.boundaries_applied} applied, ${triggerStats.boundaries_skipped} skipped (under ${formatBytes(BOUNDARY_MIN_BYTES)})${boundaryPending ? ", 1 pending" : ""}`,

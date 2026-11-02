@@ -522,3 +522,12 @@ since 2026-11-01, so these are replayed effects.
   start. To fix in the next release.
 - Design question for a later feature: persist the frozen cutoff across restarts (for example in a session entry), so
   that a resume does not re-mask. It would keep more reasoning; whether it costs more must be measured with the harness.
+
+## 10. Option A (prefix guard): all gates pass, adopted in 1.12.0 (2026-11-02)
+
+See CM-ADR-004 for the table. Summary: request byte-identical in 1,000 of 1,000 seeded cases; 9 of 9 real-API probe
+runs name the right first change against independently captured payloads, 0 false alarms in 3 clean runs; p99
+2.1-2.6 ms at 1M tokens (steady state); replay of 38 sessions, 1.11.1 against 1.12.0: every difference exactly 0.
+Probe finding: with an MCP server connecting mid-run, `pi-claude-code-use` changes `tools` twice per process (adds an
+alias at the first prompt, removes it at the second), so thinking is lost twice.
+The `cacheTtlSeconds` bug (§9.3) is fixed in the same release (spec test red on 1.11.1, green after).

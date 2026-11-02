@@ -97,6 +97,18 @@ Besides the pressure zones, two events move the cutoff. Each applies only when i
 
 **Measured result** on a 926-message real session at defaults: 42 cache variants, static cutoff yields ~$0.10 vs ≈$0.19 with no cache — ≈47% cost reduction, and prefix stays stable across full session length.
 
+### Prefix guard (v1.12.0, CM-ADR-004)
+
+Every provider request is compared with the previous one, in the order a prompt cache reads it: tools, then system,
+then messages. When something earlier than the new messages changed, condensed-milk records what changed and why:
+a tool added or removed (for example a late MCP alias), a changed system prompt, an earlier message edited or
+removed by another extension, or one of condensed-milk's own masks. On Claude 5.x such a change makes the model lose
+its earlier reasoning (thinking blocks after the change) and rewrites the prompt cache from that point.
+
+The guard only observes; the request is never changed. `/compress-stats` shows the counts, the thinking blocks at
+risk and those Anthropic reported as dropped, and the last change. Set `CM_PREFIX_GUARD_LOG=/path/file.jsonl` to get
+one JSON line per change.
+
 ### Compound Command Handling
 
 Real-world commands are chains:

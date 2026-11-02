@@ -2,6 +2,30 @@
 
 All notable changes to condensed-milk.
 
+## [1.12.0] - 2026-11-02
+
+### Added — prefix guard (CM-ADR-004)
+
+- condensed-milk now observes every provider request and names the first part that changed since the previous
+  request (tools, system, or message N, with the cause: `added <tool>`, `condensed-milk mask`, `user removed`, ...).
+  On Claude 5.x such a change makes the model lose its earlier reasoning and rewrites the prompt cache. The guard
+  never changes the request.
+- `/compress-stats` has a "Prefix guard" section: changes by kind, thinking blocks at risk, thinking blocks Anthropic
+  reported as dropped after a change, cache written right after a change, and the last change.
+- Telemetry schema 3 adds the same counters. `CM_PREFIX_GUARD_LOG=<file>` writes one JSON line per change.
+
+### Fixed
+
+- `cacheTtlSeconds` in `~/.config/condensed-milk.json` was lost at every session start, so the idle trigger used the
+  model's cache lifetime instead and was off when the model had none.
+
+### Measured
+
+- Gates fixed before the build all pass: request byte-identical in 1,000 of 1,000 seeded cases; the right change named
+  in 9 of 9 real-API probe runs (late tool alias, client mask, deleted message) and 0 false alarms in 3 clean runs;
+  p99 2.1-2.6 ms per request at 1M tokens; a replay of 38 real sessions shows no change in masking.
+- New: `bench/`, a replay-cost harness validated against 51,472 recorded calls (see `bench/README.md`).
+
 ## [1.11.1] - 2026-11-01
 
 ### Fixed — test runs with failures were reported as passing ([issue #4](https://github.com/tomooshi/condensed-milk-pi/issues/4))

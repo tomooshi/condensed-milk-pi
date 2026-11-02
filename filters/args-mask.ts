@@ -41,9 +41,10 @@ export function argsId(toolCallId: string, timestamp: unknown): string {
   return shortId(`${toolCallId}\u0000args`, timestamp);
 }
 
-/** Every leaf of an argument object in walk order, as [key path, value]. */
+/** Every leaf of an argument object in walk order, as [key path, value].
+ *  Stops one leaf past LEAVES_MAX, so callers can see that the walk was cut. */
 function leavesOf(value: unknown, key: string, depth: number, out: [string, unknown][]): void {
-  if (out.length >= LEAVES_MAX) return;
+  if (out.length > LEAVES_MAX) return;
   const container = value !== null && typeof value === "object";
   const empty = container && Object.keys(value as object).length === 0;
   if (!container || empty || depth >= LEAF_DEPTH_MAX) {
@@ -68,7 +69,11 @@ function allLeaves(args: unknown): [string, unknown][] {
 export function maskableLeaves(name: string, args: unknown): ArgLeaf[] {
   if (!ARG_TOOLS.has(name) || args === null || typeof args !== "object") return [];
   const min = name === "bash" ? BASH_COMMAND_MASK_MIN_CHARS : ARG_MASK_MIN_CHARS;
-  return allLeaves(args)
+  const leaves = allLeaves(args);
+  // At-limit action: a call with more leaves than LEAVES_MAX is never masked,
+  // because argsText could not return all of it.
+  if (leaves.length > LEAVES_MAX) return [];
+  return leaves
     .filter(([key, value]) => typeof value === "string" && key !== "path" && value.length >= min)
     .filter(([key]) => name !== "bash" || key === "command")
     .map(([key, value]) => ({ key, value: value as string }));
@@ -104,6 +109,9 @@ export function maskArgs(
     saved += leaf.value.length - placeholder.length;
   }
   if (out === args) return null;
+  if (!(saved > 0)) throw new Error("maskArgs: a changed call must save characters");
+  // Pair assertion with maskableLeaves: the masked call keeps its non-string leaves and its key paths.
+  if (allLeaves(out).length !== allLeaves(args).length) throw new Error("maskArgs: masking changed the shape of the arguments");
   return { args: out, saved };
 }
 
@@ -112,7 +120,9 @@ export function maskArgs(
  *  grep and offset/limit work per line and every value comes back
  *  byte-identical; any other value is one line `<key>: <JSON>`. */
 export function argsText(args: unknown): string {
-  const lines = allLeaves(args).flatMap(([key, value]) => {
+  const leaves = allLeaves(args);
+  if (leaves.length > LEAVES_MAX) throw new RangeError("argsText: more leaves than LEAVES_MAX; such calls are never masked");
+  const lines = leaves.flatMap(([key, value]) => {
     if (typeof value !== "string") return [`${key}: ${JSON.stringify(value)}`];
     const header = `--- ${key} (${countLines(value)} lines) ---`;
     return value.length === 0 ? [header] : [header, value];

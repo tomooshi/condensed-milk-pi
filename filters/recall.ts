@@ -159,23 +159,29 @@ function callLabel(name: string, args: Record<string, unknown>): string {
   return JSON.stringify(args);
 }
 
+/** The calls of an assistant message: labels for every call, and the calls
+ *  whose arguments a mask can replace (CM-ADR-005), with their argsText size. */
+function assistantCalls(msg: any): Pick<LightEntry, "kind" | "calls" | "argCalls" | "timestamp"> {
+  const blocks = Array.isArray(msg.content) ? msg.content : [];
+  const toolCalls = blocks.filter((b: any) => b?.type === "toolCall" && typeof (b.id ?? b.toolCallId) === "string");
+  const calls = toolCalls.map((b: any) => ({ toolCallId: b.id ?? b.toolCallId, label: labelKey(callLabel(String(b.name ?? ""), b.arguments ?? b.input ?? {})) }));
+  // Only calls a mask can change get a record; argsText needs maskable leaves.
+  const argCalls = toolCalls
+    .filter((b: any) => maskableLeaves(String(b.name ?? ""), b.arguments ?? b.input).length > 0)
+    .map((b: any) => {
+      const text = argsText(b.arguments ?? b.input);
+      return { toolCallId: b.id ?? b.toolCallId, toolName: String(b.name), lineCount: countLines(text), size: text.length };
+    });
+  if (argCalls.length > calls.length) throw new Error("assistantCalls: more argument records than calls");
+  return { kind: "assistant", calls, argCalls, timestamp: msg.timestamp };
+}
+
 /** Reduce a session entry to what recall needs. Pure. */
 export function lightEntry(entry: any): LightEntry {
   if (typeof entry?.id !== "string") throw new TypeError("lightEntry: entry has no string id");
   const base = { id: entry.id, parentId: typeof entry.parentId === "string" ? entry.parentId : null };
   const msg = entry.type === "message" ? entry.message : undefined;
-  if (msg?.role === "assistant") {
-    const blocks = Array.isArray(msg.content) ? msg.content : [];
-    const toolCalls = blocks.filter((b: any) => b?.type === "toolCall" && typeof (b.id ?? b.toolCallId) === "string");
-    const calls = toolCalls.map((b: any) => ({ toolCallId: b.id ?? b.toolCallId, label: labelKey(callLabel(String(b.name ?? ""), b.arguments ?? b.input ?? {})) }));
-    const argCalls = toolCalls
-      .filter((b: any) => maskableLeaves(String(b.name ?? ""), b.arguments ?? b.input).length > 0)
-      .map((b: any) => {
-        const text = argsText(b.arguments ?? b.input);
-        return { toolCallId: b.id ?? b.toolCallId, toolName: String(b.name), lineCount: countLines(text), size: text.length };
-      });
-    return { ...base, kind: "assistant", calls, argCalls, timestamp: msg.timestamp };
-  }
+  if (msg?.role === "assistant") return { ...base, ...assistantCalls(msg) };
   if (msg?.role === "toolResult" && typeof msg.toolCallId === "string") {
     const text = toolResultText(msg);
     const keep = msg.details?.condensedMilk;

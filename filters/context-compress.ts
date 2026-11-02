@@ -521,6 +521,8 @@ function maskCallArguments(m: any, scope: MaskScope): MaskOutcome | null {
     return block.arguments !== undefined ? { ...block, arguments: masked.args } : { ...block, input: masked.args };
   });
   if (argCalls.length === 0) return null;
+  if (content.length !== msg.content.length) throw new Error("maskCallArguments: masking changed the block count");
+  if (!(saved > 0)) throw new Error("maskCallArguments: masked calls must save characters");
   const updated = { ...msg, content };
   return { message: m?.message ? { ...m, message: updated } : updated, bytesSaved: saved, argCalls };
 }

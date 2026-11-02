@@ -175,15 +175,20 @@ function toolKey(entry, argsById) {
 const textOf = (m) => (Array.isArray(m?.content) ? m.content.filter((c) => c?.type === "text").map((c) => c.text ?? "").join("\n") : String(m?.content ?? ""));
 
 /** Message sizes for the token model. An assistant message costs its recorded
- *  output tokens, minus its reasoning tokens once its thinking is invalid. */
-function sizesOf(messages, usageByTs, valid) {
-	return messages.map((m) => {
+ *  output tokens, minus its reasoning tokens once its thinking is invalid,
+ *  minus the characters an arm removed from it (negative chars, divided by
+ *  the fitted ratio later; 1.13.0, docs §11.1). `raw` is the unedited list,
+ *  index for index; an arm that leaves a message alone adds exactly zero. */
+function sizesOf(messages, usageByTs, valid, raw) {
+	if (raw.length !== messages.length) throw new Error("sizesOf: an arm changed the message count");
+	return messages.map((m, i) => {
 		if (m?.role !== "assistant") return { chars: contentChars(m), assistantTokens: imageCount(m) * IMAGE_TOKENS };
 		const u = usageByTs.get(m.timestamp);
 		if (!u) return { chars: contentChars(m), assistantTokens: 0 };
 		const key = thinkingKey(m);
 		const dropped = key !== null && valid.get(key) === false;
-		return { chars: 0, assistantTokens: (u.output ?? 0) - (dropped ? (u.reasoning ?? 0) : 0) };
+		const removed = raw[i] === m ? 0 : contentChars(raw[i]) - contentChars(m);
+		return { chars: -removed, assistantTokens: (u.output ?? 0) - (dropped ? (u.reasoning ?? 0) : 0) };
 	});
 }
 
@@ -225,7 +230,7 @@ function looksLikeRestart(call, transformed, state) {
 	if (call.prevRecPrompt === null || !call.claude) return false;
 	const recFall = call.prevRecPrompt - call.recPrompt;
 	if (recFall <= RESTART_FALL_MIN_TOKENS || call.recRead >= 0.5 * call.prevRecPrompt) return false;
-	const sizes = sizesOf(transformed, state.usageByTs, state.arms[0].valid);
+	const sizes = sizesOf(transformed, state.usageByTs, state.arms[0].valid, call.raw);
 	const now = sizes.reduce((t, x) => t + x.assistantTokens + x.chars / state.charsPerToken, 0);
 	return state.arms[0].promptPrev - now < 0.5 * recFall;
 }
@@ -272,7 +277,7 @@ async function processCall(call, arms, state, ctx) {
  *  null when the recorded read is not well below the modeled one. */
 function exogenousBreak(call, transformed, prefixEnd, state) {
 	if (!call.claude || !call.warm) return null;
-	const sizes = sizesOf(transformed, state.usageByTs, state.arms[0].valid);
+	const sizes = sizesOf(transformed, state.usageByTs, state.arms[0].valid, call.raw);
 	if (state.offset === null) state.offset = call.recPrompt - sizes.reduce((t, x) => t + x.assistantTokens + x.chars / state.charsPerToken, 0);
 	let cum = state.offset;
 	let breakAt = null;
@@ -289,7 +294,7 @@ function exogenousBreak(call, transformed, prefixEnd, state) {
  *  (for arm comparisons). */
 function finishArmCall(r, prefixEnd, breakAt, call, state) {
 	const { a, transformed } = r;
-	const sizes = sizesOf(transformed, state.usageByTs, a.valid);
+	const sizes = sizesOf(transformed, state.usageByTs, a.valid, call.raw);
 	const total = sizes.reduce((s, x) => ({ chars: s.chars + x.chars, assistantTokens: s.assistantTokens + x.assistantTokens }), { chars: 0, assistantTokens: 0 });
 	const read = readPrefix(sizes, prefixEnd, call.warm);
 	const shocked = readPrefix(sizes, breakAt === null ? prefixEnd : Math.min(prefixEnd, breakAt), call.warm);

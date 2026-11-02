@@ -426,6 +426,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       thresholds: [...activeProfile.thresholds],
       coverage: [...activeProfile.coverage],
       showStatus: config.showStatus,
+      // 1.12.0 fix: 1.11.1 dropped this here, which turned the idle trigger
+      // off whenever the model had no promptCache value.
+      cacheTtlSeconds: config.cacheTtlSeconds,
     };
     const cmds = registeredCommands();
     if (config.showStatus) {

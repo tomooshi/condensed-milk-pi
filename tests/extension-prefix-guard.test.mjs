@@ -85,7 +85,7 @@ await emit("session_shutdown", {}, ctx);
 delete process.env.CONDENSED_MILK_TELEMETRY;
 const telemetryFile = join(home, ".config", "condensed-milk-sessions.jsonl");
 const entry = existsSync(telemetryFile) ? JSON.parse(readFileSync(telemetryFile, "utf8").trim().split("\n").at(-1)) : {};
-// test-edit: schema 4 and version 1.13.0 since CM-ADR-007; the schema-3 fields below are unchanged.
+// test-edit: schema 4 and version 1.13.0 since CM-ADR-006; the schema-3 fields below are unchanged.
 check("telemetry schema 4", [entry.schema, entry.version], [4, "1.13.0"]);
 check("telemetry prefix counters", [entry.prefix_edits_tools, entry.prefix_edits_system, entry.prefix_edits_messages, entry.prefix_edits_cm_mask, entry.prefix_edits_removed], [1, 0, 1, 1, 0]);
 check("telemetry thinking and cache counters", [entry.thinking_at_risk, entry.thinking_dropped_after_edit, entry.cache_write_after_edit], [3, 2, 12500]);

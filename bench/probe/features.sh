@@ -6,8 +6,8 @@
 #
 # cd       write a file, read CONVENTIONS.md twice, make 40 KB of output, then
 #          `echo BOUNDARY` (a configured boundary command) so the next request
-#          carries masked arguments (C) and a collapsed read (D). A reference
-#          file is never masked by the cutoff, so only D can mask its older copy. Gate: the request with the masks is
+#          carries masked arguments (C). (The two reads probed D, collapse, which
+#          failed its offline gate and was removed.) Gate: the request with the masks is
 #          accepted and answered.
 # b1       default rules plus one invalidation rule (`echo INVALIDATE` makes an
 #          earlier `cat notes.txt` stale). A boundary sets the cutoff, then cat,
@@ -40,8 +40,8 @@ P_B1="Work in five steps, one bash call per step. Step 1: run seq 1 1200 | awk '
 
 for i in $(seq 1 "$RUNS"); do
   d="$OUT/$PROVIDER-$MODE-$i"; rm -rf "$d"; mkdir -p "$d/home/.config" "$d/home/.pi/agent" "$d/w"
-  features='{"maskArgs":true,"collapseReads":true,"batchInvalidation":true,"persistCutoff":true}'
-  [ "$MODE" = b1-base ] && features='{"maskArgs":false,"collapseReads":false,"batchInvalidation":false,"persistCutoff":false}'
+  features='{"maskArgs":true,"batchInvalidation":true}'
+  [ "$MODE" = b1-base ] && features='{"maskArgs":false,"batchInvalidation":false}'
   echo "{\"features\":$features}" > "$d/home/.config/condensed-milk.json"
   if [ "$MODE" = cd ] || [ "$MODE" = cd2 ]; then
     echo '{"boundaryCommands":["^echo BOUNDARY"]}' > "$d/home/.pi/agent/condensed-milk-config.json"

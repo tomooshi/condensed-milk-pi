@@ -1,15 +1,18 @@
 /**
- * CM-ADR-005/006/007 spec, extension wiring for 1.13.0: masked arguments and
- * collapse at mask events, the cutoff kept across a pi restart (session
- * entry), the live A/B switch, schema-4 telemetry, recall of masked
+ * CM-ADR-005/006 spec, extension wiring for 1.13.0: masked arguments at mask
+ * events, the live A/B switch, schema-4 telemetry, recall of masked
  * arguments, and the new explainer. Drives the real index.ts through a fake pi.
+ *
+ * test-edit: D (collapse) and R (cutoff kept across a restart) failed their
+ * pre-registered gates (docs §12) and were removed; their checks left this
+ * file (R's restore checks, the state entry, D/R feature keys and counters).
  */
 import { writeFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { loadTs, makeFakePi, makeCtx, makeSessionManager, makeRunner, assistantCall, toolResult, userMsg, entriesFor, textOf, isolateHome } from "./harness.mjs";
 
-const { check, done } = makeRunner("CM-ADR-005/006/007 extension: 1.13.0 features");
+const { check, done } = makeRunner("CM-ADR-005/006 extension: 1.13.0 features");
 const home = isolateHome();
 mkdirSync(join(home, ".config"), { recursive: true });
 const CONFIG = join(home, ".config", "condensed-milk.json");
@@ -28,16 +31,6 @@ function history(pairs) {
 	}
 	return out;
 }
-/** [user, (bash call, result) x pairs] with 5,000-char distinct results. */
-function bashHistory(pairs) {
-	const out = [userMsg("go")];
-	for (let i = 0; i < pairs; i++) {
-		out.push(assistantCall(`c${i}`, "bash", { command: `cat f${i}` }));
-		out.push(toolResult(`c${i}`, "bash", `${"r".repeat(5_000)}${i}`));
-	}
-	return out;
-}
-const maskedResults = (ms) => ms.filter((m) => m.role === "toolResult" && textOf(m).startsWith("[cm-masked")).length;
 const maskedArgs = (ms) => ms.filter((m) => m.role === "assistant" && JSON.stringify(m.content).includes("[cm-masked arg")).length;
 const ctxFor = (entries, tokens, sessionId = "test-session") => ({ ...makeCtx({ tokens, entries }), sessionManager: { ...makeSessionManager(entries), getSessionId: () => sessionId } });
 async function fresh(entries = [], sessionId = "test-session") {
@@ -63,31 +56,13 @@ async function pass(f, messages, tokens, entries = [], sessionId = "test-session
 	check("explainer bytes", (await f.fire("before_agent_start", { systemPrompt: "BASE" }, makeCtx())).systemPrompt, "BASE" + EXPLAINER);
 }
 
-// C at a zone entry; state written once per change (R)
+// C at a zone entry
 {
 	const f = await fresh();
-	const h = history(20); // 41 messages
+	const h = history(20); // 41 messages, zone 2 cutoff 38
 	const out = await pass(f, h, 700_000);
 	check("zone 2 masks the arguments before the cutoff", maskedArgs(out), 19);
-	check("one state entry after the zone entry", f.appended, [{ customType: "condensed-milk-state", data: { v: 1, cutoff: 38, zone: 2, horizon: 41 } }]);
-	await pass(f, h, 700_000);
-	check("no new state entry without a change", f.appended.length, 1);
-}
-
-// R: restore after a restart; never across a compaction
-{
-	const h2 = bashHistory(40); // 81 messages; zone 2 at 41 messages froze the cutoff at 38
-	const stateEntry = { type: "custom", customType: "condensed-milk-state", data: { v: 1, cutoff: 38, zone: 2, horizon: 41 }, id: "s1", parentId: "e40", timestamp: new Date(1_700_000_040_500).toISOString() };
-	const ents = entriesFor(h2);
-	const withState = [...ents.slice(0, 41), stateEntry, ...ents.slice(41)];
-	const restored = await fresh(withState);
-	check("a restart keeps the cutoff (results 2..36)", maskedResults(await pass(restored, h2, 700_000, withState)), 18);
-	const plain = await fresh(ents);
-	check("without a state entry the restart re-masks at the new length (results 2..74)", maskedResults(await pass(plain, h2, 700_000, ents)), 37);
-	const compaction = { type: "compaction", id: "c1", parentId: "s1", timestamp: stateEntry.timestamp, summary: "x", firstKeptEntryId: "e41", tokensBefore: 1 };
-	const afterCompaction = [...ents.slice(0, 41), stateEntry, compaction, ...ents.slice(41)];
-	const compacted = await fresh(afterCompaction);
-	check("a state entry before a compaction is not used", maskedResults(await pass(compacted, h2, 700_000, afterCompaction)), 37);
+	check("the next call renders the same bytes", JSON.stringify(await pass(f, h, 700_000)), JSON.stringify(out));
 }
 
 // cm_recall returns masked arguments byte-identical
@@ -111,7 +86,6 @@ async function pass(f, messages, tokens, entries = [], sessionId = "test-session
 	writeFileSync(CONFIG, JSON.stringify({ experiment: { ab: true } }));
 	const c = await fresh([], controlId);
 	check("control: no masked arguments", maskedArgs(await pass(c, history(20), 700_000, [], controlId)), 0);
-	check("control: no state entry", c.appended.length, 0);
 	const t = await fresh([], treatmentId);
 	check("treatment: masked arguments", maskedArgs(await pass(t, history(20), 700_000, [], treatmentId)), 19);
 	writeFileSync(CONFIG, JSON.stringify({ features: { maskArgs: false } }));
@@ -134,9 +108,9 @@ async function pass(f, messages, tokens, entries = [], sessionId = "test-session
 	check("schema", entry.schema, 4);
 	check("version", entry.version, "1.13.0");
 	check("arm", entry.arm, "default");
-	check("features", entry.features, { maskArgs: true, collapseReads: true, batchInvalidation: true, persistCutoff: true });
+	check("features", entry.features, { maskArgs: true, batchInvalidation: true });
 	check("quality proxies", [entry.user_prompts, entry.tool_results, entry.tool_errors, entry.edit_not_found], [1, 2, 1, 1]);
-	check("feature counters", [entry.args_masked, entry.collapsed, entry.state_restored, entry.state_writes], [19, 0, false, 1]);
+	check("masked-argument counter", entry.args_masked, 19);
 }
 
 done();

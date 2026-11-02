@@ -132,11 +132,9 @@ async function prepareArm(spec, root, index) {
 	if (existsSync(rules)) copyFileSync(rules, join(home, ".pi", "agent", "condensed-milk-config.json"));
 	process.env.HOME = home;
 	const ext = (await loadTsAbsolute(join(src, "index.ts"))).default;
-	const { pi, fire, appended } = makeFakePi();
+	const { pi, fire } = makeFakePi();
 	ext(pi);
-	// `appended`: entries the arm wrote with pi.appendEntry since the last drain;
-	// `extra`: those entries placed on this session's branch (1.13.0 state entries).
-	return { name, home, fire, appended, extra: [], sourceHash: hashDir(src) };
+	return { name, home, fire, sourceHash: hashDir(src) };
 }
 
 function hashDir(dir) {
@@ -245,12 +243,9 @@ async function processCall(call, arms, state, ctx) {
 		let transformed = await fireContext(arm, a, index, call, state, ctx);
 		if (index === 0 && looksLikeRestart(call, transformed, state)) {
 			state.restarts++;
-			// The process that would have written arm 0's entry for this call never
-			// ran: the restart came before it.
-			arm.appended.length = 0;
 			for (const other of arms) {
 				process.env.HOME = other.home;
-				await other.fire("session_start", { reason: "resume" }, withExtra(ctx, other));
+				await other.fire("session_start", { reason: "resume" }, ctx);
 			}
 			transformed = await fireContext(arm, a, index, call, state, ctx);
 		}
@@ -325,8 +320,6 @@ async function replaySession(path, bytes, arms, pi) {
 		arms: arms.map(() => ({ prev: [], valid: new Map(), masked: new Set(), promptPrev: 0, series: [], counters: { cmEdits: 0, thinkingInvalidatedByEdit: 0, thinkingInvalidatedExogenous: 0, refetchIdenticalAfterMask: 0, masksAtLastCall: 0 } })),
 	};
 	for (const arm of arms) {
-		arm.appended.length = 0;
-		arm.extra.length = 0;
 		process.env.HOME = arm.home;
 		await arm.fire("session_start", { reason: "startup" }, minimalCtx(branch, -1, byId, undefined));
 	}
@@ -361,7 +354,6 @@ async function replaySession(path, bytes, arms, pi) {
 			const ctx = minimalCtx(branch, k - 1, byId, modelFor(pi, m));
 			globalThis.Date.now = () => ts;
 			await processCall(call, arms, state, ctx);
-			drainAppended(arms, k);
 			rec.push([(u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0), u.cacheRead ?? 0, u.cacheWrite ?? 0, u.output ?? 0, u.reasoning ?? 0, call.newDrops, call.warm ? 1 : 0, String(m.model).startsWith("claude") ? 1 : 0]);
 			prevDrops = drops;
 			prevRaw = raw.slice();
@@ -402,30 +394,6 @@ async function afterToolResult(e, arms, state, argsById, lastResultByKey, branch
 		for (const a of state.arms) if (a.masked.has(prev.toolCallId)) a.counters.refetchIdenticalAfterMask++;
 	}
 	lastResultByKey.set(key, { toolCallId: m.toolCallId, hash });
-}
-
-/** ctx whose branch also holds the arm's own appended entries, each after the
- *  branch entry that was the leaf when the arm wrote it. */
-function withExtra(ctx, arm) {
-	const merged = () => {
-		const branch = ctx.sessionManager.getBranch();
-		const out = [];
-		let j = 0;
-		for (let i = 0; i < branch.length; i++) {
-			out.push(branch[i]);
-			for (; j < arm.extra.length && arm.extra[j].pos <= i; j++) if (arm.extra[j].pos === i) out.push(arm.extra[j].entry);
-		}
-		return out;
-	};
-	return { ...ctx, sessionManager: { ...ctx.sessionManager, getBranch: merged } };
-}
-
-/** Move entries an arm appended during the call at branch index k onto the branch (leaf k - 1). */
-function drainAppended(arms, k) {
-	for (const arm of arms) {
-		for (const a of arm.appended) arm.extra.push({ pos: k - 1, entry: { type: "custom", customType: a.customType, data: a.data, id: `cm-extra-${arm.extra.length}`, parentId: null } });
-		arm.appended.length = 0;
-	}
 }
 
 function minimalCtx(branch, leafIndex, byId, model) {

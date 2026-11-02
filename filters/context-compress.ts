@@ -34,11 +34,10 @@
  * id) so `cm_recall` can return the original; `cm_recall` results are
  * masked past the cutoff like bash results.
  *
- * v1.13.0 (CM-ADR-005): three changes that only move at mask events, each
+ * v1.13.0 (CM-ADR-005): two changes that only move at mask events, each
  * behind a feature flag: long edit/write/bash arguments are masked past the
- * cutoff (C); superseded reads and duplicate results before the event horizon
- * collapse (D); bash invalidation counts only commands before the event
- * horizon (B1). `eventHorizon` is the message count at the last mask event.
+ * cutoff (C); bash invalidation counts only commands before the event horizon
+ * (B1). `eventHorizon` is the message count at the last mask event.
  */
 
 import type { PlaceholderTemplates, ThinkingMaskPolicy } from "./profiles.js";
@@ -46,7 +45,6 @@ import { renderPlaceholder, DEFAULT_PLACEHOLDERS } from "./profiles.js";
 import { countLines, formatSize, shortId } from "./text-metrics.js";
 import { recallLabel } from "./recall.js";
 import { argsId, maskArgs } from "./args-mask.js";
-import { collapsePlan, type CollapseEntry } from "./collapse.js";
 
 export { countLines, formatSize };
 
@@ -287,8 +285,6 @@ export interface CompressResult {
   masksApplied: number;
   /** v1.13.0: tool-call ids whose arguments were masked (C). */
   maskedArgCalls: string[];
-  /** v1.13.0: tool-call ids of results collapsed by D. */
-  collapsedCalls: string[];
   /** The cutoff index used for this pass. Consumer persists this across
    *  calls so T doesn't regress. */
   cutoffIdx: number;
@@ -326,15 +322,14 @@ export interface CompressOptions {
   maskOldThinking?: ThinkingMaskPolicy;
   /** v1.13.0 (CM-ADR-005): changes that wait for mask events. Absent = off. */
   features?: MaskFeatures;
-  /** v1.13.0: message count at the last mask event. D and B1 use only the
-   *  messages before it, so their bytes do not change between events. */
+  /** v1.13.0: message count at the last mask event. B1 uses only the
+   *  messages before it, so its bytes do not change between events. */
   eventHorizon?: number;
 }
 
 /** v1.13.0 (CM-ADR-005) feature flags of the masker. */
 export interface MaskFeatures {
   maskArgs?: boolean;
-  collapseReads?: boolean;
   batchInvalidation?: boolean;
 }
 
@@ -417,8 +412,8 @@ export function compressStaleToolResults(
   const { cutoffIdx } = decideCutoff(messages.length, opts);
   const features = opts.features ?? {};
   const horizon = Math.min(Math.max(0, opts.eventHorizon ?? 0), messages.length);
-  // With D and B1 off this is 1.12.0's rule exactly: no cutoff, no masks.
-  const horizonWorks = horizon > 0 && (features.collapseReads === true || features.batchInvalidation === true);
+  // With B1 off this is 1.12.0's rule exactly: no cutoff, no masks.
+  const horizonWorks = horizon > 0 && features.batchInvalidation === true;
   if (cutoffIdx <= 0 && !horizonWorks) return null;
   if (cutoffIdx > messages.length) throw new Error("compressStaleToolResults: cutoff past the end of messages");
 
@@ -432,9 +427,6 @@ export function compressStaleToolResults(
     toolCallIndex,
     features,
     invalidationLimit: features.batchInvalidation ? horizon : messages.length,
-    collapse: features.collapseReads
-      ? collapsePlan(messages, horizon, (id) => toolCallIndex.get(id), { minChars: MIN_MASK_LENGTH, isPlaceholder: isAlreadyMasked })
-      : new Map(),
   };
   const outcomes = messages.map((m: any, idx: number) => maskMessage(m, idx, scope));
   if (outcomes.length !== messages.length) throw new Error("compressStaleToolResults: masking changed the message count");
@@ -449,7 +441,6 @@ export function compressStaleToolResults(
     maskedPaths: applied.flatMap((o) => (o.path ? [o.path] : [])),
     maskedCommands: applied.flatMap((o) => (o.command ? [o.command] : [])),
     maskedArgCalls: applied.flatMap((o) => o.argCalls ?? []),
-    collapsedCalls: applied.flatMap((o) => (o.collapsedCall ? [o.collapsedCall] : [])),
   };
 }
 
@@ -464,8 +455,6 @@ interface MaskScope {
   features: MaskFeatures;
   /** Invalidating commands count only below this index (B1: the horizon). */
   invalidationLimit: number;
-  /** D: index -> why the result collapses (empty when D is off). */
-  collapse: Map<number, CollapseEntry>;
 }
 
 /** One message after masking. `bytesSaved` is null when nothing changed. */
@@ -475,7 +464,6 @@ interface MaskOutcome {
   command?: string;
   path?: string;
   argCalls?: string[];
-  collapsedCall?: string;
 }
 
 /** Decide and apply the mask for one message: a tool result (by tool kind)
@@ -490,8 +478,8 @@ function maskMessage(m: any, idx: number, scope: MaskScope): MaskOutcome {
     if (content.length < MIN_MASK_LENGTH) return unchanged;
     const target: MaskTarget = { m, msg, idx, content, pastCutoff };
     const vars = { id: shortId(String(msg.toolCallId ?? ""), msg.timestamp), n: countLines(content), size: formatSize(content.length) };
-    if (msg.toolName === "bash") return maskBash(target, vars, scope) ?? maskCollapsed(target, vars, scope) ?? unchanged;
-    if (msg.toolName === "read") return maskRead(target, vars, scope) ?? maskCollapsed(target, vars, scope) ?? unchanged;
+    if (msg.toolName === "bash") return maskBash(target, vars, scope) ?? unchanged;
+    if (msg.toolName === "read") return maskRead(target, vars, scope) ?? unchanged;
     if (msg.toolName === RECALL_TOOL_NAME) return maskRecall(target, vars, scope) ?? unchanged;
     return unchanged;
   }
@@ -537,19 +525,6 @@ function maskCallArguments(m: any, scope: MaskScope): MaskOutcome | null {
   return { message: m?.message ? { ...m, message: updated } : updated, bytesSaved: saved, argCalls };
 }
 
-/** D: a result that a newer one supersedes; the placeholder names the newer id. */
-function maskCollapsed(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): MaskOutcome | null {
-  const entry = scope.collapse.get(t.idx);
-  if (!entry) return null;
-  const newer = shortId(entry.newerToolCallId, entry.newerTimestamp);
-  const suffix = entry.reason === "same text" ? ` — same text as #${newer}` : ` — newer read #${newer}`;
-  const base = t.msg.toolName === "read"
-    ? renderPlaceholder(scope.templates.read, { ...vars, path: extractPath(t.msg, scope.toolCallIndex) })
-    : renderPlaceholder(scope.templates.bash, { ...vars, cmd: (extractCommand(t.msg, scope.toolCallIndex) || UNKNOWN_COMMAND).slice(0, PLACEHOLDER_COMMAND_CHARS_MAX) });
-  const outcome = applyMask(t.m, t.content, base + suffix, {});
-  return { ...outcome, collapsedCall: String(t.msg.toolCallId ?? "") };
-}
-
 /** One tool result that is long enough to mask. */
 interface MaskTarget { m: any; msg: any; idx: number; content: string; pastCutoff: boolean }
 type PlaceholderVars = { id: string; n: number; size: string };
@@ -590,7 +565,7 @@ function applyMask(m: any, content: string, placeholder: string, what: { command
  *  the model). `cwd` is parsed from a `cd X && ` prefix and used for
  *  invalidation scoping. `recallLabel` is set for cm_recall calls.
  *  Handles live + persisted shapes. */
-type ToolCallEntry = { command?: string; path?: string; offset?: unknown; limit?: unknown; cwd?: string; recallLabel?: string };
+type ToolCallEntry = { command?: string; path?: string; cwd?: string; recallLabel?: string };
 function buildToolCallIndex(messages: any[]): Map<string, ToolCallEntry> {
   const calls = messages
     .map((m: any) => m?.message ?? m)
@@ -602,8 +577,6 @@ function buildToolCallIndex(messages: any[]): Map<string, ToolCallEntry> {
     const entry: ToolCallEntry = {
       command: rawCmd,
       path: typeof args.path === "string" ? args.path : undefined,
-      offset: args.offset,
-      limit: args.limit,
       cwd: rawCmd ? parseCdPrefix(rawCmd).cwd : undefined,
       recallLabel: block.name === RECALL_TOOL_NAME ? recallLabel(args) : undefined,
     };

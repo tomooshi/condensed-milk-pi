@@ -80,9 +80,7 @@ export function makeFakePi() {
 	const tools = new Map();
 	const commands = new Map();
 	const busHandlers = new Map();
-	const appended = [];
 	const pi = {
-		appendEntry(customType, data) { appended.push({ customType, data }); },
 		on(name, fn) {
 			if (!handlers.has(name)) handlers.set(name, []);
 			handlers.get(name).push(fn);
@@ -103,7 +101,7 @@ export function makeFakePi() {
 		for (const fn of handlers.get(name) ?? []) last = await fn(event, ctx);
 		return last;
 	}
-	return { pi, handlers, tools, commands, fire, appended };
+	return { pi, handlers, tools, commands, fire };
 }
 
 /** Fake session manager over a list of session entries (the branch, in order). */

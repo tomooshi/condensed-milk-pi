@@ -95,5 +95,8 @@ jobs:
             console.log("npm " + process.argv[1] + " supports trusted publishing");
           ' "$(npm --version)"
 
+      # Verbose: when the OIDC exchange fails, npm falls back to no login and
+      # the registry answers 404; only the verbose log says why (npm redacts
+      # tokens in its logs).
       - name: Publish
-        run: npm publish --access public
+        run: npm publish --access public --loglevel verbose

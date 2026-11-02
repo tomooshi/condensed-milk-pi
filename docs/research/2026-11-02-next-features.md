@@ -597,7 +597,9 @@ claude-opus-5-5 cache prices. Probes: `bench/probe/features.sh`. Raw outputs: `/
 | R | Thinking invalidated down, CI below zero | -7,462 [-13,689, -2,837] | Pass |
 | R | Cost <= +1% (point), <= +2% (CI upper) | +$1,119 [348, 2,075], +17% | **Fail** |
 
-Shipped in 1.13.0: C and B1, on by default. D and R are removed (code kept in commit db5746e).
+Shipped in 1.13.0: C and B1, on by default. D and R are removed (code kept in commit db5746e). The release source (source hash
+4cd63c551b71, after D and R were removed and assertions added) gives per-call results identical to the gated C
+arm in all 38 sessions (run 5 against run 3), and 1.13.0 with both features off equals 1.12.0 exactly (run 3).
 
 ### 12.2 What the release does to cost and reasoning (30 days)
 

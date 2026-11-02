@@ -481,3 +481,44 @@ edit; blocks produced after the edit are kept. On the Earendil path no earlier t
 Decision: the switch is not recommended on current evidence. It would trade a fixable loss (prefix edits, sections
 8.1-8.6) for a permanent one. Reopen if Claude Code starts passing `stream-json` thinking through, or if a paired
 test shows no quality loss.
+
+## 9. Replay-cost harness: built and validated (2026-11-02)
+
+`bench/` (see `bench/README.md`). It drives copies of the real `index.ts` through pi's own session projection and
+usage estimate, on 38 sessions (51,472 calls, 30 days).
+
+### 9.1 Harness gates (§6.1)
+
+| Gate | Result |
+|---|---|
+| Two runs byte-identical | Pass (two runs, same SHA-256) |
+| Replayed cache reads within 10% of recorded per-session totals, Spearman >= 0.95 (17 held-out sessions) | Pass: aggregate -4.9%, median per session 6.2%, Spearman 1.000 |
+| A/A check (two identical arms) | Every difference exactly 0 |
+| Positive control: zones off | +$1,572 [699, 2,667] and +3.96B prompt tokens per 30 days |
+
+The first version failed the gate (+13.5% reads, median prompt error 12.2%). The cause was pi restarts: the extension
+resets its zones on `session_start`, so a resumed session re-enters the highest zone with coverage applied to the
+current message count and masks more than a continuous run. Session files record no restart; the harness infers 379
+of them (rule in `bench/README.md`). After that, the median prompt error per call is 3.8%.
+
+### 9.2 First findings from the controls (30 days, arm minus 1.11.1 with the operator's config)
+
+| Arm | Cost | Thinking blocks invalidated by edits | Identical re-fetches of masked results |
+|---|---|---|---|
+| Idle trigger off | +$142 [66, 236] | +12 [-204, 220] (no measurable effect) | 0 [-4, 4] |
+| Boundary trigger off (`bd close`) | +$49 [15, 92] | -704 [-1,471, -105] | -30 [-70, -3] |
+| Both off | +$191 [99, 304] | -663 [-1,379, -80] | -31 [-70, -4] |
+
+Reading: the idle advance saves money at no measurable cost to reasoning. The task boundary saves less and costs
+reasoning and re-fetches; it is a candidate to remove or to tune. Both triggers are 1.11 features that ran live only
+since 2026-11-01, so these are replayed effects.
+
+### 9.3 Other findings
+
+- The operator's rules config has `disableDefaults: true` and no invalidation rules (since 2026-10-12), so bash
+  invalidation does not run in this setup. The measured B1 excess (§8.6) was a correlation, not condensed-milk's edit.
+  B1 is relevant only to users with the default rules.
+- Bug in 1.11.1: `session_start` rebuilds `config` without `cacheTtlSeconds`, so that setting is lost after every
+  start. To fix in the next release.
+- Design question for a later feature: persist the frozen cutoff across restarts (for example in a session entry), so
+  that a resume does not re-mask. It would keep more reasoning; whether it costs more must be measured with the harness.

@@ -53,6 +53,11 @@ export function isolateHome() {
 
 /** Import a repo-relative TypeScript module through jiti. */
 export async function loadTs(relPath) {
+	return loadTsAbsolute(join(REPO, relPath));
+}
+
+/** Import a TypeScript module by absolute path through the same jiti (bench arms load copies of the source). */
+export async function loadTsAbsolute(absPath) {
 	isolateHome();
 	if (!jitiInstance) {
 		const { createJiti, nodeModules } = await loadJitiFactory();
@@ -61,7 +66,12 @@ export async function loadTs(relPath) {
 			alias: { "@earendil-works/pi-ai": join(nodeModules, "@earendil-works", "pi-ai") },
 		});
 	}
-	return jitiInstance.import(join(REPO, relPath));
+	return jitiInstance.import(absPath);
+}
+
+/** The node_modules directory of the pi install whose jiti the harness uses. */
+export async function piNodeModules() {
+	return (await loadJitiFactory()).nodeModules;
 }
 
 /** Fake ExtensionAPI: records handlers, tools and commands; fires events in order. */

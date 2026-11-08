@@ -56,6 +56,7 @@ import {
 import { createRecallTool, type RecallOutcome } from "./io/recall-tool.js";
 import { comparePayloads, type PrefixChange } from "./filters/prefix-guard.js";
 import { DEFAULT_FEATURES, resolveFeatures, type Arm, type Features } from "./filters/features.js";
+import { blockReason, findPlaceholderArgument, placeholderMatchers } from "./filters/placeholder-guard.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 import {
   resolveProfile,
@@ -116,8 +117,9 @@ const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.j
 // v1.11.0: schema 2 adds recall and trigger counters (CM-ADR-002 §7).
 // v1.12.0: schema 3 adds prefix-guard counters (CM-ADR-004).
 // v1.13.0: schema 4 adds the A/B arm, features and quality proxies (CM-ADR-006).
-const TELEMETRY_SCHEMA_VERSION = 4;
-const PACKAGE_VERSION = "1.13.0";
+// v1.13.1: schema 5 adds placeholder_calls_blocked (CM-ADR-007).
+const TELEMETRY_SCHEMA_VERSION = 5;
+const PACKAGE_VERSION = "1.13.1";
 
 /** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
  *  extension (e.g. user-installed third-party tools with identifying names)
@@ -422,7 +424,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     // v1.8.0: reset telemetry session state
     sessionStartIso = new Date().toISOString();
     sessionStartReason = (event as any)?.reason ?? "startup";
-    sessionSessionFile = (event as any)?.previousSessionFile;
+    // v1.13.1: the session that will end is the current one. The old code read
+    // previousSessionFile, which pi sets only on a switch, so the hash was null.
+    sessionSessionFile = ctx?.sessionManager?.getSessionFile?.() ?? (event as any)?.previousSessionFile;
     toolCounts.clear();
     zonesEnteredLog.length = 0;
     resetRecallAndTriggerStats();
@@ -582,6 +586,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         tool_errors: toolErrors,
         edit_not_found: editNotFound,
         args_masked: argsMaskedCalls.size,
+        // v1.13.1 schema 5 (CM-ADR-007)
+        placeholder_calls_blocked: placeholderBlocked,
       };
       mkdirSync(dirname(TELEMETRY_LOG_PATH), { recursive: true });
       appendFileSync(TELEMETRY_LOG_PATH, JSON.stringify(entry) + "\n");
@@ -612,6 +618,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let maskHorizon = 0;
   const argsMaskedCalls = new Set<string>();
   let userPrompts = 0;
+  let placeholderBlocked = 0;
   let toolResultsCount = 0;
   let toolErrors = 0;
   let editNotFound = 0;
@@ -624,6 +631,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     maskHorizon = 0;
     argsMaskedCalls.clear();
     userPrompts = 0;
+    placeholderBlocked = 0;
     toolResultsCount = 0;
     toolErrors = 0;
     editNotFound = 0;
@@ -764,6 +772,18 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         "info",
       );
     },
+  });
+
+  // v1.13.1 (CM-ADR-007): never let a placeholder become content. A call whose
+  // string argument IS a placeholder is blocked; the agent gets the reason as
+  // the tool result and retries with real content or a recall. pi also sends
+  // codemode's nested calls through this hook.
+  pi.on("tool_call", (event: any) => {
+    if (event?.toolName === "cm_recall") return undefined;
+    const found = findPlaceholderArgument(event?.input, placeholderMatchers(activeProfile.placeholderFormat));
+    if (!found) return undefined;
+    placeholderBlocked++;
+    return { block: true, reason: blockReason(found) };
   });
 
   pi.on("tool_result", async (event, ctx) => {
@@ -1140,6 +1160,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         `  With grep: ${recallStats.with_grep} | raw: ${recallStats.with_raw} | other session: ${recallStats.cross_session}`,
         `  Bytes returned: ${formatBytes(recallStats.bytes_returned)} | avg turns ago: ${recallStats.by_id > 0 ? (recallStats.turns_ago_sum / recallStats.by_id).toFixed(1) : "—"}`,
         `  Recall then re-run: ${recallStats.then_rerun}`,
+        `  Placeholder calls blocked (v1.13.1): ${placeholderBlocked}`,
         "",
         "Prefix guard (v1.12.0)",
         `  Prefix edits: tools ${guard.tools}, system ${guard.system}, messages ${guard.messages} (condensed-milk masks ${guard.cmMask}), removed ${guard.removed}`,

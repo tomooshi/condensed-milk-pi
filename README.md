@@ -115,6 +115,11 @@ Both change bytes only at mask events, which already rewrite the cache. Measured
 To turn either off, add `"features": {"maskArgs": false}` or `{"batchInvalidation": false}` to
 `~/.config/condensed-milk.json`. Gates and raw numbers: `docs/research/2026-11-02-next-features.md` §12.
 
+**Placeholder guard (v1.13.1, CM-ADR-007).** In live use the model sometimes copied an argument placeholder into a
+new call (once into a `write`, which replaced a file's content). condensed-milk now blocks any tool call whose string
+argument is a whole placeholder and tells the agent to write the real content or call `cm_recall`. Text that only
+mentions a placeholder is allowed. `/compress-stats` shows the count.
+
 **Live A/B (CM-ADR-006).** `"experiment": {"ab": true}` in `~/.config/condensed-milk.json` gives each session a fixed
 arm from its id: `control` (1.12.0 behavior) or `treatment`. Telemetry schema 4 records the arm and quality counts
 (turns per prompt, failed edits, tool errors), so the two arms can be compared after a few weeks.

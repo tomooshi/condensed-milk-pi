@@ -2,6 +2,31 @@
 
 All notable changes to condensed-milk.
 
+## [1.13.1] - 2026-11-07
+
+### Fixed — a placeholder can no longer become file content (CM-ADR-007)
+
+- Live use of 1.13.0 showed a new failure: three times in 5 days the model wrote a placeholder with an invented id
+  into a new tool call, copying the masked arguments of its own earlier calls. Two calls failed (a bash command, an
+  edit). One `write` succeeded and replaced a 13.1 KB document with the one-line placeholder.
+- condensed-milk now blocks any tool call (except `cm_recall`) whose string argument is a whole-value placeholder,
+  and tells the agent to write the real content or recall the original. A value that only mentions a placeholder
+  among other text is allowed. Checked on 87,546 real tool calls: it blocks exactly the 3 bad calls and nothing else.
+  Real pi 1.5 probe: the write is blocked and no file is created.
+- Telemetry schema 5 counts blocked calls. If they exceed 1 per 1,000 calls in sessions with masked arguments,
+  masked arguments go off by default in the next release.
+
+### Fixed
+
+- Telemetry `session_id_hash` was always null; it now hashes the session file.
+- Tests run under pi 1.5 (it moved TypeBox's `Type` out of pi-ai's root). condensed-milk itself was not affected.
+
+### Measured — 1.13.0 in live use (5 days)
+
+- Masked arguments saved 8.2% of cache cost on 10 real sessions (2,617 calls), close to the replay's 11.9%.
+- Failed edits went down (mojo session 3.3% → 2.3%, prediction-market 3.4% → 1.3%); turns per prompt and tool
+  errors did not go up. Details: `docs/research/2026-11-02-next-features.md` §13.
+
 ## [1.13.0] - 2026-11-02
 
 Five candidates were built and tested against gates fixed before the build

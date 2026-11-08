@@ -623,3 +623,43 @@ after the edit. C's live gates (turns per prompt, failed edits) decide whether t
   more but can hide a range the agent still needs.
 - **Live gates** run after the release: set `"experiment": {"ab": true}` (CM-ADR-006) and read schema-4 telemetry
   after at least 14 days and 30 sessions per arm.
+
+## 13. Live check of 1.13.0 and release 1.13.1 (2026-11-07)
+
+Data: 5 days of live use (2026-11-02 to 2026-11-07), operator's sessions only.
+
+### 13.1 Savings (replay of the live sessions, features on vs off, same 1.13.0 source)
+
+10 sessions that ran 1.13.0, 2,617 calls on their active branches: prompt tokens 596M -> 549M (-8.0%), cache cost
+$181 -> $166 (-$15, -8.2%), cache writes -8.4%. Close to the -11.9% the offline replay predicted (§12.2).
+
+### 13.2 Live gates of CM-ADR-005 (before/after, no A/B; the operator chose not to run one)
+
+| Gate | Before 1.13.0 | With 1.13.0 | Verdict |
+|---|---|---|---|
+| Edit "could not find" rate, mojo-template-pi-dev session (same session) | 3.3% (50/1,501) | 2.3% (14/596) | Pass |
+| Same, prediction-market project | 3.4% (54/1,592) | 1.3% (5/377) | Pass |
+| Turns per prompt, mojo session | 11.3 | 10.5 | Pass |
+| Tool error rate, mojo session (session-file count) | 11.6% | 10.4% | Pass |
+| Recall then re-run | — | 0 | Pass |
+
+### 13.3 New failure mode: fabricated placeholders
+
+Three times the model wrote a placeholder with an invented id (no call in the session has that id) as an argument of
+a new call: bash command (Nov 4, failed), edit `oldText` (Nov 5, failed), write `content` (Nov 6, succeeded: a 13.1 KB
+document was replaced by the placeholder; the text was never generated, so nothing could restore it). In the 40 days
+before 1.13.0, 0 of 87,546 tool calls did this. Explanation: 1.13.0 puts placeholders into the model's own earlier
+turns, and the model imitates its own past output; result placeholders sit in tool results and were never copied.
+The gates of §6.1 did not cover a write that succeeds with a placeholder.
+
+### 13.4 Release 1.13.1
+
+- CM-ADR-007 placeholder guard: blocks a call whose string argument is a whole-value placeholder. On all 87,546 calls
+  of 40 days it blocks exactly the 3 fabrications and nothing else. Real pi 1.5 probe: blocked, error shown, file not
+  written. Rule: more than 1 blocked call per 1,000 calls in sessions with masked arguments turns `maskArgs` off by
+  default in the next release.
+- Telemetry `session_id_hash` fixed (it was always null).
+- pi 1.5 (installed 2026-11-06) removed TypeBox's `Type` from pi-ai's root; extensions get a compat view, so
+  condensed-milk runs unchanged, but the test harness aliased the bare package and 7 of 20 test files failed. The
+  harness now uses the view. 21/21 test files pass under pi 1.5 and 1.0.4; the replay tool gives identical results
+  under both.

@@ -63,10 +63,19 @@ export async function loadTsAbsolute(absPath) {
 		const { createJiti, nodeModules } = await loadJitiFactory();
 		jitiInstance = createJiti(import.meta.url, {
 			moduleCache: true,
-			alias: { "@earendil-works/pi-ai": join(nodeModules, "@earendil-works", "pi-ai") },
+			alias: { "@earendil-works/pi-ai": piAiForExtensions(nodeModules) },
 		});
 	}
 	return jitiInstance.import(absPath);
+}
+
+/** What `@earendil-works/pi-ai` means inside an extension. pi 1.5 removed
+ *  TypeBox's `Type` from pi-ai's root and gives extensions a compat view that
+ *  keeps it (pi-coding-agent dist/core/extensions/loader.js getAliases);
+ *  pi 1.0.x exports `Type` from pi-ai itself. Use the view when it exists. */
+function piAiForExtensions(nodeModules) {
+	const view = join(nodeModules, "@earendil-works", "pi-coding-agent", "dist", "core", "extensions", "pi-ai-extension-view.js");
+	return existsSync(view) ? view : join(nodeModules, "@earendil-works", "pi-ai");
 }
 
 /** The node_modules directory of the pi install whose jiti the harness uses. */

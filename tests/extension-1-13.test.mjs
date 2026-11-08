@@ -94,19 +94,27 @@ async function pass(f, messages, tokens, entries = [], sessionId = "test-session
 	rmSync(CONFIG);
 }
 
-// telemetry schema 4
+// telemetry schema 5 (test-edit: 1.13.1, CM-ADR-007 adds the guard counter;
+// session_id_hash now comes from the session file, as the README says)
 {
 	process.env.CONDENSED_MILK_TELEMETRY = "on";
-	const f = await fresh();
+	const SESSION_FILE = "/sessions/--repo--/2026-11-08T00-00-00-000Z_test.jsonl";
+	const f = makeFakePi();
+	ext(f.pi);
+	const withFile = { ...makeCtx(), sessionManager: { ...makeSessionManager([]), getSessionFile: () => SESSION_FILE, getSessionId: () => "test-session" } };
+	await f.fire("session_start", { reason: "startup" }, withFile);
 	await f.fire("before_agent_start", { systemPrompt: "" }, makeCtx());
 	await pass(f, history(20), 700_000);
 	await f.fire("tool_result", { toolName: "edit", toolCallId: "x1", input: { path: "/a" }, content: [{ type: "text", text: "Could not find the exact text in /a. The old text must match exactly including all whitespace and newlines." }], isError: true }, makeCtx());
 	await f.fire("tool_result", { toolName: "read", toolCallId: "x2", input: { path: "/a" }, content: [{ type: "text", text: "ok" }], isError: false }, makeCtx());
+	await f.fire("tool_call", { toolName: "write", toolCallId: "x3", input: { path: "/a", content: "[cm-masked arg #6dc87b4b46] write content (175 lines, 13.1KB)" } }, makeCtx());
 	await f.fire("session_shutdown", {}, makeCtx());
 	delete process.env.CONDENSED_MILK_TELEMETRY;
 	const entry = JSON.parse(readFileSync(join(home, ".config", "condensed-milk-sessions.jsonl"), "utf-8").trim().split("\n").at(-1));
-	check("schema", entry.schema, 4);
-	check("version", entry.version, "1.13.0");
+	check("schema", entry.schema, 5);
+	check("version", entry.version, "1.13.1");
+	check("session_id_hash is sha256 of the session file", entry.session_id_hash, createHash("sha256").update(SESSION_FILE).digest("hex").slice(0, 16));
+	check("blocked placeholder calls", entry.placeholder_calls_blocked, 1);
 	check("arm", entry.arm, "default");
 	check("features", entry.features, { maskArgs: true, batchInvalidation: true });
 	check("quality proxies", [entry.user_prompts, entry.tool_results, entry.tool_errors, entry.edit_not_found], [1, 2, 1, 1]);

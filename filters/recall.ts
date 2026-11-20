@@ -263,6 +263,33 @@ const oneLine = (s: string) => labelKey(s).slice(0, LABEL_CHARS_MAX);
 const row = (r: RecallRecord) =>
   `#${r.id} · ${r.turnsAgo} turns ago · ${r.toolName} · ${oneLine(r.label)} · ${r.lineCount} lines, ${formatSize(r.size)}`;
 
+/** A leading PCRE-style inline flag group, for example `(?i)`. JavaScript
+ *  has no such prefix (CM-ADR-008: 8 of 12 recall errors in the field). */
+const INLINE_FLAGS = /^\(\?([A-Za-z]+)\)/;
+/** inherited: the inline flags that mean the same as a JavaScript RegExp flag. */
+const INLINE_FLAGS_SUPPORTED = "ims";
+const GREP_HINT = "grep is a JavaScript regular expression; a leading (?i), (?m) or (?s) is accepted.";
+
+/** Compile a `grep` pattern. A leading `(?i)`, `(?m)` or `(?s)` group moves
+ *  into the RegExp flags; any other inline flag, or a pattern RegExp rejects,
+ *  is an error value (an invalid pattern from the agent is an expected
+ *  outcome). The result is never global or sticky, so `test` has no state. */
+export function compileGrep(pattern: string): { kind: "ok"; regex: RegExp } | { kind: "error"; text: string } {
+  if (typeof pattern !== "string") throw new TypeError("compileGrep: pattern must be a string");
+  const inline = INLINE_FLAGS.exec(pattern);
+  const letters = inline ? [...new Set(inline[1])] : [];
+  const unsupported = letters.find((f) => !INLINE_FLAGS_SUPPORTED.includes(f));
+  if (unsupported !== undefined) return { kind: "error", text: `invalid grep pattern: inline flag "${unsupported}" is not supported. ${GREP_HINT}` };
+  try {
+    const regex = new RegExp(inline ? pattern.slice(inline[0].length) : pattern, letters.join(""));
+    if (regex.global || regex.sticky) throw new Error("compileGrep: a stateful pattern would skip lines");
+    return { kind: "ok", regex };
+  } catch (e) {
+    if (!(e instanceof SyntaxError)) throw e;
+    return { kind: "error", text: `invalid grep pattern: ${e.message}. ${GREP_HINT}` };
+  }
+}
+
 /** Check the request shape; null when it is valid. Pure. */
 function validateRequest(request: RecallRequest): string | null {
   const hasId = request.id !== undefined;
@@ -279,12 +306,8 @@ function validateRequest(request: RecallRequest): string | null {
     if (v !== undefined && !(Number.isInteger(v) && v >= 1)) return `${key} must be a whole number of at least 1 (got ${String(v)}).`;
   }
   if (request.grep !== undefined) {
-    try {
-      new RegExp(request.grep);
-    } catch (e) {
-      // An invalid pattern from the agent is an expected outcome: report it as a value.
-      return `invalid grep pattern: ${(e as Error).message}`;
-    }
+    const compiled = compileGrep(request.grep);
+    if (compiled.kind === "error") return compiled.text;
   }
   return null;
 }
@@ -359,8 +382,9 @@ function selectLines(lines: string[], request: RecallRequest): { numbered: { n: 
   const last = Math.min(lines.length, request.limit !== undefined ? first + request.limit - 1 : lines.length);
   const window = lines.slice(first - 1, last).map((text, i) => ({ n: first + i, text }));
   if (request.grep === undefined) return { numbered: window, first, last };
-  const pattern = new RegExp(request.grep);
-  return { numbered: window.filter((l) => pattern.test(l.text)), first, last };
+  const compiled = compileGrep(request.grep);
+  if (compiled.kind === "error") throw new Error(`selectLines: grep passed validation but does not compile (${compiled.text})`);
+  return { numbered: window.filter((l) => compiled.regex.test(l.text)), first, last };
 }
 
 /** Lines that fit the caps. A first line longer than bytesMax is cut inside

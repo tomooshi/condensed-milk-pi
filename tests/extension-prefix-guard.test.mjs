@@ -60,6 +60,8 @@ process.env.CONDENSED_MILK_TELEMETRY = "on"; // read at session_start
 // test-edit: the log is switched on only for this phase; the property loop above also makes edits.
 process.env.CM_PREFIX_GUARD_LOG = logPath;
 await emit("session_start", { reason: "startup" }, ctx);
+// test-edit: schema 6 (CM-ADR-008) writes no row for a session without a model call, so the session has one.
+await emit("context", { messages: [] }, ctx);
 const m1 = [resultMsg("u", "go"), thinkingMsg("a1"), resultMsg("a1", "one")];
 await emit("before_provider_request", { payload: payload([tool("bash")], m1) }, ctx);
 await emit("message_end", assistantEnd(9000, []), ctx);
@@ -85,8 +87,8 @@ await emit("session_shutdown", {}, ctx);
 delete process.env.CONDENSED_MILK_TELEMETRY;
 const telemetryFile = join(home, ".config", "condensed-milk-sessions.jsonl");
 const entry = existsSync(telemetryFile) ? JSON.parse(readFileSync(telemetryFile, "utf8").trim().split("\n").at(-1)) : {};
-// test-edit: schema 5 and version 1.13.1 since CM-ADR-007; the schema-3 fields below are unchanged.
-check("telemetry schema 5", [entry.schema, entry.version], [5, "1.13.1"]);
+// test-edit: schema 6 and version 1.14.0 since CM-ADR-008; the schema-3 fields below are unchanged.
+check("telemetry schema 6", [entry.schema, entry.version], [6, "1.14.0"]);
 check("telemetry prefix counters", [entry.prefix_edits_tools, entry.prefix_edits_system, entry.prefix_edits_messages, entry.prefix_edits_cm_mask, entry.prefix_edits_removed], [1, 0, 1, 1, 0]);
 check("telemetry thinking and cache counters", [entry.thinking_at_risk, entry.thinking_dropped_after_edit, entry.cache_write_after_edit], [3, 2, 12500]);
 

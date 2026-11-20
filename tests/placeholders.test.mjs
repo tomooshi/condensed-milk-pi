@@ -31,14 +31,29 @@ const ALL_MASKED = { previousCutoff: 1_000, zoneEntered: 2, contextUsage: 0.9 };
 		userMsg("next"),
 	];
 	const out = cc.compressStaleToolResults(msgs, { ...ALL_MASKED, previousCutoff: msgs.length }).messages;
-	check("bash placeholder", textOf(out[2]), `[cm-masked bash #${sid("c0")}] git status (41 lines, 203B)`);
-	check("read placeholder", textOf(out[4]), `[cm-masked read #${sid("r0")}] /repo/src/a.ts (41 lines, 203B)`);
-	check("recall placeholder", textOf(out[6]), `[cm-masked recall #${sid("k0")}] id=3f9a2c1d7e grep="err" (41 lines, 203B)`);
-	check("bash with unknown command", textOf(out[8]), `[cm-masked bash #${sid("u0")}] (command unknown) (41 lines, 203B)`);
+	check("bash placeholder", textOf(out[2]), `[cm-masked bash #${sid("c0")}] git status (41 lines, 203B; cm_recall returns it)`);
+	check("read placeholder", textOf(out[4]), `[cm-masked read #${sid("r0")}] /repo/src/a.ts (41 lines, 203B; cm_recall returns it)`);
+	check("recall placeholder", textOf(out[6]), `[cm-masked recall #${sid("k0")}] id=3f9a2c1d7e grep="err" (41 lines, 203B; cm_recall returns it)`);
+	check("bash with unknown command", textOf(out[8]), `[cm-masked bash #${sid("u0")}] (command unknown) (41 lines, 203B; cm_recall returns it)`);
 	check("a long command is cut to 80 chars", textOf(cc.compressStaleToolResults(
 		[assistantCall("L", "bash", { command: "x".repeat(100) }), toolResult("L", "bash", BIG), userMsg("n")],
 		{ ...ALL_MASKED, previousCutoff: 3 },
-	).messages[1]), `[cm-masked bash #${sid("L")}] ${"x".repeat(80)} (41 lines, 203B)`);
+	).messages[1]), `[cm-masked bash #${sid("L")}] ${"x".repeat(80)} (41 lines, 203B; cm_recall returns it)`);
+	// test-edit (CM-ADR-008): every built-in placeholder above now ends with "; cm_recall returns it".
+	// CM-ADR-008: a placeholder that is not shorter than the content is not applied.
+	const SMALL = "y".repeat(130); // over MIN_MASK_LENGTH (120), under the 148-character placeholder
+	const kept = cc.compressStaleToolResults(
+		[assistantCall("S", "bash", { command: "x".repeat(100) }), toolResult("S", "bash", SMALL), userMsg("n")],
+		{ ...ALL_MASKED, previousCutoff: 3 },
+	);
+	check("a placeholder longer than the content is not applied", kept === null ? SMALL : textOf(kept.messages[1]), SMALL);
+	const one = (len) => cc.compressStaleToolResults(
+		[assistantCall("B", "bash", { command: "x".repeat(80) }), toolResult("B", "bash", "z".repeat(len)), userMsg("n")],
+		{ ...ALL_MASKED, previousCutoff: 3 },
+	);
+	const P = textOf(one(200).messages[1]).length; // the placeholder length for a 3-digit size
+	check("boundary: content as long as the placeholder stays", one(P), null);
+	check("boundary: content 1 character longer is masked", textOf(one(P + 1).messages[1]).length, P);
 }
 
 // (4) legacy placeholders are not re-masked
@@ -93,11 +108,12 @@ const ALL_MASKED = { previousCutoff: 1_000, zoneEntered: 2, contextUsage: 0.9 };
 // (5) profiles
 {
 	const want = {
-		bash: "[cm-masked bash #{id}] {cmd} ({n} lines, {size})",
-		read: "[cm-masked read #{id}] {path} ({n} lines, {size})",
-		recall: "[cm-masked recall #{id}] {cmd} ({n} lines, {size})",
+		// test-edit (CM-ADR-009): bash and read end with {digest}, which renders as nothing when the feature is off.
+		bash: "[cm-masked bash #{id}] {cmd} ({n} lines, {size}; cm_recall returns it){digest}",
+		read: "[cm-masked read #{id}] {path} ({n} lines, {size}; cm_recall returns it){digest}",
+		recall: "[cm-masked recall #{id}] {cmd} ({n} lines, {size}; cm_recall returns it)",
 		// test-edit: CM-ADR-005 adds the arguments kind (1.13.0).
-		arg: "[cm-masked arg #{id}] {cmd} ({n} lines, {size})",
+		arg: "[cm-masked arg #{id}] {cmd} ({n} lines, {size}; cm_recall returns it)",
 	};
 	check("default profile templates", profiles.BUILT_IN_PROFILES.default.placeholderFormat, want);
 	check("qwen-vllm profile templates", profiles.BUILT_IN_PROFILES["qwen-vllm"].placeholderFormat, want);

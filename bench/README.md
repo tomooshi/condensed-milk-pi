@@ -54,8 +54,25 @@ without it, the arm uses copies of the operator's real files. Runs read sessions
 Known bias: median prompt-size error per call 3.8% (p90 21%); with shocks, reads -6.1% and writes +13.1% against the
 recording. Prices are claude-opus-5-5's (pi `anthropic.json`).
 
+## Re-read study
+
+`run --reads-out reads.jsonl` also writes, for the first arm, every successful read, edit and write with its path and
+time, the call at which each result is first masked, and the mask events. The file holds file paths: keep it on your
+machine. `node bench/reread-study.mjs reads.jsonl` prints numbers only: how many reads follow a masked read of the
+same path, why, and what a rule that keeps recently used reads would save and cost. Result of 2026-11-18 and the gate
+for a later candidate: `docs/research/2026-11-18-field-data.md` §5.
+
+## Share numbers from your sessions
+
+`bench/share.sh [DAYS] [SESSIONS_DIR]` replays your own sessions (no API call) and writes `run.json` and
+`reread.json`: sizes, token counts and totals. The files hold no prompt, output, command or path, and the script
+checks that before it ends. `node bench/analyze.mjs run.json` reads the first file without the sessions.
+
 ## Other gate tools
 
+- `bench/probe/digest.sh OUT_DIR [RUNS]`: real-API probe of the placeholder digest (about 30k tokens per run):
+  a masked result ends with a summary naming two failed checks, and the agent is asked for the names.
+  `check-digest.py` counts correct answers and tool calls for each arm.
 - `node --expose-gc bench/guard-overhead.mjs`: prefix-guard overhead at a 1M-token request (gate: p99 < 5 ms).
 - `bench/probe/run.sh OUT_DIR [RUNS]`: real-API probe runs (uses the subscription, about 60k tokens per run) for four
   conditions: clean, late tool alias (MCP on), injected mask, injected deletion. `bench/probe/check.py` compares the

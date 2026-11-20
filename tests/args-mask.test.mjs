@@ -42,12 +42,13 @@ const history = () => [
 {
 	const msgs = history();
 	const out = cc.compressStaleToolResults(msgs, opts(11)).messages;
-	check("write content is masked", callArgs(out[1]), { path: "/repo/a.ts", content: `[cm-masked arg #${aid("w1")}] write content (81 lines, 323B)` });
+	// test-edit (CM-ADR-008): the built-in arg placeholder now ends with "; cm_recall returns it".
+	check("write content is masked", callArgs(out[1]), { path: "/repo/a.ts", content: `[cm-masked arg #${aid("w1")}] write content (81 lines, 323B; cm_recall returns it)` });
 	check("edit oldText is masked, short newText stays", callArgs(out[3]), {
 		path: "/repo/a.ts",
-		edits: [{ oldText: `[cm-masked arg #${aid("e1")}] edit edits[0].oldText (81 lines, 323B)`, newText: SHORT }],
+		edits: [{ oldText: `[cm-masked arg #${aid("e1")}] edit edits[0].oldText (81 lines, 323B; cm_recall returns it)`, newText: SHORT }],
 	});
-	check("a bash command of 2,048+ chars is masked", callArgs(out[5]), { command: `[cm-masked arg #${aid("b1")}] bash command (302 lines, 2.7KB)` });
+	check("a bash command of 2,048+ chars is masked", callArgs(out[5]), { command: `[cm-masked arg #${aid("b1")}] bash command (302 lines, 2.7KB; cm_recall returns it)` });
 	check("a short bash command stays", callArgs(out[7]), { command: "ls -la" });
 	check("a reference path is never masked", callArgs(out[9]), { path: "/repo/AGENTS.md", content: LONG });
 	check("calls after the cutoff stay", callArgs(out[11]), { path: "/repo/late.ts", content: LONG });

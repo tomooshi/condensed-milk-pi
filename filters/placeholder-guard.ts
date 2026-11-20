@@ -22,7 +22,7 @@ const DEPTH_MAX = 8;
  *  than this is not seen in 30 days of sessions. */
 const LEAVES_MAX = 512;
 /** Template variables and what each may match (no newlines anywhere). */
-const VARIABLE = /\{(id|cmd|path|n|size)\}/g;
+const VARIABLE = /\{(id|cmd|path|n|size|digest)\}/g;
 /** arbitrary: a custom template needs this much fixed text, or its matcher
  *  would match ordinary one-line values (a template of only "{cmd}"). */
 const TEMPLATE_LITERAL_CHARS_MIN = 6;

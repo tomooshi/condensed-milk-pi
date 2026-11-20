@@ -2,8 +2,9 @@
  * Feature flags of 1.13.0 and the live A/B switch (CM-ADR-006). Pure: the
  * parsed config and the session id in, the session's arm and features out.
  *
- * Only features that passed their pre-registered offline and probe gates
- * (docs/research/2026-11-02-next-features.md §12) exist here. The live gates
+ * Features that passed their pre-registered offline and probe gates
+ * (docs/research/2026-11-02-next-features.md §12) are on by default. `digest`
+ * (1.14.0) is the one opt-in: see its field below. The live gates
  * (turns per prompt, edit "could not find" errors, recall then re-run, tool
  * errors) are read from schema-4 telemetry after at least 14 days.
  */
@@ -15,12 +16,16 @@ export interface Features {
   maskArgs: boolean;
   /** B1: bash invalidation waits for the next mask event. */
   batchInvalidation: boolean;
+  /** v1.14.0 (CM-ADR-009): bash and read placeholders end with a digest. Off
+   *  by default: it passed its live probe (no recall call needed, 6 of 6
+   *  runs) and failed its replay cost gate (+1.1% cache cost, limit 1%). */
+  digest: boolean;
 }
 
 /** Defaults: the features that passed their gates (docs §12). */
-export const DEFAULT_FEATURES: Features = { maskArgs: true, batchInvalidation: true };
+export const DEFAULT_FEATURES: Features = { maskArgs: true, batchInvalidation: true, digest: false };
 /** The control arm: 1.12.0 behavior. */
-const OFF_FEATURES: Features = { maskArgs: false, batchInvalidation: false };
+const OFF_FEATURES: Features = { maskArgs: false, batchInvalidation: false, digest: false };
 /** Salt of the arm hash; a new experiment gets a new salt. */
 const AB_SALT = "cm-ab-1";
 

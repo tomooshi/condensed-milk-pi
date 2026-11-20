@@ -54,8 +54,9 @@ import {
   passesMinBytes,
 } from "./filters/triggers.js";
 import { createRecallTool, type RecallOutcome } from "./io/recall-tool.js";
-import { comparePayloads, type PrefixChange } from "./filters/prefix-guard.js";
+import { changeExcerpt, compareWithLineage, gapBucket, LINEAGE_MAX, MESSAGE_CLASSES, type MessageClass, type PrefixChange } from "./filters/prefix-guard.js";
 import { DEFAULT_FEATURES, resolveFeatures, type Arm, type Features } from "./filters/features.js";
+import { callKey, newDupTracker } from "./filters/dup-calls.js";
 import { blockReason, findPlaceholderArgument, placeholderMatchers } from "./filters/placeholder-guard.js";
 import { stripAnsi } from "./filters/ansi-strip.js";
 import {
@@ -118,8 +119,20 @@ const TELEMETRY_LOG_PATH = join(homedir(), ".config", "condensed-milk-sessions.j
 // v1.12.0: schema 3 adds prefix-guard counters (CM-ADR-004).
 // v1.13.0: schema 4 adds the A/B arm, features and quality proxies (CM-ADR-006).
 // v1.13.1: schema 5 adds placeholder_calls_blocked (CM-ADR-007).
-const TELEMETRY_SCHEMA_VERSION = 5;
-const PACKAGE_VERSION = "1.13.1";
+// v1.14.0: schema 6 (CM-ADR-008): no row for a session without turns; counters
+// survive a compaction; token totals come from this run's responses; prefix
+// edits carry the message kind, the distance from the end and the turn.
+const TELEMETRY_SCHEMA_VERSION = 6;
+const PACKAGE_VERSION = "1.14.0";
+/** arbitrary: system and tools edits listed per telemetry row (turn and
+ *  position only). The counters still count every edit; issue #5 showed one
+ *  system edit per session, so 8 covers the known cases. */
+const PREFIX_EDITS_LOGGED_MAX = 8;
+/** derived: one path per assistant message that has a thinking block, so at
+ *  most RECALL_SCAN_ENTRIES_MAX (the longest branch bound). At the limit no
+ *  path is added and a repeated report can count again, still never above
+ *  the blocks at risk. */
+const DROP_PATHS_TRACKED_MAX = 65_536;
 
 /** v1.8.0: allowlist of pi built-in tool names. Any tool name from a custom
  *  extension (e.g. user-installed third-party tools with identifying names)
@@ -304,13 +317,15 @@ const USER_RULES: ResolvedRules = resolveRules(loadUserRulesConfig());
 // to re-run; agents use a recall tool only when told to (StructMemEval).
 // v1.13.0 (CM-ADR-005): names masked arguments, and forbids copying a
 // placeholder into a new call (an edit with a placeholder as oldText fails).
-const CM_EXPLAINER =
-  "\n\ncondensed-milk: old tool results and long tool-call arguments can appear as\n" +
+const CM_EXPLAINER_BODY =
+  "condensed-milk: old tool results and long tool-call arguments can appear as\n" +
   "`[cm-masked bash|read|recall|arg #id] …` to keep the prompt cache stable. To see one\n" +
   "exactly as it was first shown, call `cm_recall` with the id (add `grep`, or\n" +
   "`offset`/`limit`, for part of it). To see the current state, re-run the command or\n" +
   "re-read the file. Each costs one step, so do it only when the next step needs the content.\n" +
   "Never copy a placeholder into a new tool call.";
+/** Name of the prompt section that carries the explainer (CM-ADR-008 §8). */
+const CM_EXPLAINER_SECTION = "condensed_milk";
 
 /** v1.13.0: read the raw config object for `features` and `experiment`
  *  (CM-ADR-006). A missing file means defaults. */
@@ -364,7 +379,18 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   // Constant string → byte-identical turn-over-turn → cache-stable.
   pi.on("before_agent_start", (event) => {
     userPrompts++;  // v1.13.0 quality proxy: turns per prompt (CM-ADR-006)
-    return { systemPrompt: event.systemPrompt + CM_EXPLAINER };
+    // v1.14.0 (CM-ADR-008 §8): a prompt section, not a forced prompt. Returning
+    // `systemPrompt` makes pi fold every later prompt or tool change into the
+    // head of the request (a full cache rewrite and dropped thinking blocks);
+    // with a section pi sends such a change at the end of the request.
+    const options = (event as { systemPromptOptions?: { sections?: Record<string, string>; forceSystemPrompt?: string } }).systemPromptOptions;
+    const sections = options?.sections;
+    if (options && options.forceSystemPrompt === undefined && sections !== null && typeof sections === "object") {
+      sections[CM_EXPLAINER_SECTION] = CM_EXPLAINER_BODY;
+      return undefined;
+    }
+    // Older pi, or an earlier extension already forced the prompt: append.
+    return { systemPrompt: `${event.systemPrompt}\n\n${CM_EXPLAINER_BODY}` };
   });
 
   // Subagents: compress too — they benefit from smaller output
@@ -386,6 +412,31 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let sessionStartIso = new Date().toISOString();
   let sessionStartReason: string = "startup";
   let sessionSessionFile: string | undefined;
+  let sessionSessionId: string | undefined;
+  // v1.14.0 (CM-ADR-008) telemetry state that a compaction must not reset.
+  /** Counters of the segments that ended with a compaction or a branch change. */
+  const carried = { bytesFreed: 0, maskEvents: 0, uniqueReads: 0, uniqueBashes: 0, reReadByRead: 0, reReadByBash: 0, reReadTurnsDeltaSum: 0 };
+  /** Usage of the assistant responses of this run (not of the messages in
+   *  context: those shrink at a compaction and repeat in a resumed session). */
+  const runUsage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, responses: 0 };
+  let compactions = 0;
+  let positionResets = 0;
+  /** Context usage (0..1) at the newest model call; null when pi gave none. */
+  let lastContextPct: number | null = null;
+
+  function resetRunTelemetry(): void {
+    for (const key of Object.keys(carried) as (keyof typeof carried)[]) carried[key] = 0;
+    for (const key of Object.keys(runUsage) as (keyof typeof runUsage)[]) runUsage[key] = 0;
+    compactions = 0;
+    positionResets = 0;
+    lastContextPct = null;
+  }
+
+  /** The session id from pi, or undefined (a failed observation is not an error). */
+  function readSessionId(ctx: any): string | undefined {
+    const id = ctx?.sessionManager?.getSessionId?.();
+    return typeof id === "string" && id !== "" ? id : undefined;
+  }
   const toolCounts = new Map<string, number>();
   // v1.11.0: `by` says which trigger entered the zone (pressure or idle).
   const zonesEnteredLog: Array<{ zone: number; at_turn: number; at_ctx_pct: number; by: "pressure" | "idle" }> = [];
@@ -427,6 +478,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     // v1.13.1: the session that will end is the current one. The old code read
     // previousSessionFile, which pi sets only on a switch, so the hash was null.
     sessionSessionFile = ctx?.sessionManager?.getSessionFile?.() ?? (event as any)?.previousSessionFile;
+    // v1.14.0 (CM-ADR-008): pi has no file with --no-session; the id is the fallback.
+    sessionSessionId = readSessionId(ctx);
+    resetRunTelemetry();
     toolCounts.clear();
     zonesEnteredLog.length = 0;
     resetRecallAndTriggerStats();
@@ -478,10 +532,27 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   // v1.10.1: branch navigation (session_tree; pi-context's context_compact
   // branches from an earlier node) shrinks messages exactly like compaction,
   // so it needs the same reset. Same function, three triggers.
-  pi.on("session_compact", async (_event, _ctx) => resetPositionState());
+  pi.on("session_compact", async (_event, _ctx) => {
+    compactions++;
+    resetPositionState();
+  });
   pi.on("session_tree", async (_event, _ctx) => resetPositionState());
 
+  /** v1.14.0 (CM-ADR-008): the segment's counters move into `carried` first,
+   *  so the telemetry row covers the whole run. /compress-stats still shows
+   *  the segment since the reset. Unique masks are unique within a segment,
+   *  the same scope as the re-read counters they are the denominator of. */
   function resetPositionState(): void {
+    positionResets++;
+    carried.bytesFreed += contextSaved;
+    carried.maskEvents += contextMaskEvents;
+    carried.uniqueReads += everMaskedReads.size;
+    carried.uniqueBashes += everMaskedBashes.size;
+    carried.reReadByRead += reReadByRead;
+    carried.reReadByBash += reReadByBash;
+    carried.reReadTurnsDeltaSum += reReadTurnsDeltaSum;
+    // A changed history renumbers the messages, so the drop paths seen so far no longer name them.
+    guardSeenDrops.clear();
     persistentCutoff = 0;
     zoneEntered = -1;
     maskHorizon = 0;
@@ -507,22 +578,29 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   // v1.8.0: on shutdown, if opt-in, append one JSONL line. Never writes without
   // explicit opt-in. Runs on graceful shutdown only (Ctrl+C/D, SIGHUP, SIGTERM);
   // crashed sessions skipped, which is acceptable — we only want clean data.
-  pi.on("session_shutdown", async (_event, _ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     if (!telemetryConfig.local) return;
+    // v1.14.0 (CM-ADR-008): a session that made no model call has nothing to
+    // report (3,398 of 4,621 rows in the first shared export were such rows).
+    if (turnCounter === 0) return;
     try {
       const endedIso = new Date().toISOString();
       const startMs = Date.parse(sessionStartIso);
       const endMs = Date.parse(endedIso);
       const durationMs = Number.isFinite(startMs) && Number.isFinite(endMs) ? endMs - startMs : 0;
-      const totalAllInput = totalInput + totalCacheRead + totalCacheWrite;
-      const cacheHitRate = totalAllInput > 0 ? totalCacheRead / totalAllInput : 0;
+      const totalAllInput = runUsage.input + runUsage.cacheRead + runUsage.cacheWrite;
+      const cacheHitRate = totalAllInput > 0 ? runUsage.cacheRead / totalAllInput : 0;
       const toolCountsObj: Record<string, number> = {};
       for (const [k, v] of toolCounts) toolCountsObj[k] = v;
       const cwdHash = createHash("sha256").update(process.cwd()).digest("hex").slice(0, 16);
-      const sessionIdHash = sessionSessionFile
-        ? createHash("sha256").update(sessionSessionFile).digest("hex").slice(0, 16)
-        : null;
-      const reReads = reReadByRead + reReadByBash;
+      const sessionIdHash = hashSessionKey(sessionKey({
+        fileAtShutdown: ctx?.sessionManager?.getSessionFile?.(),
+        fileAtStart: sessionSessionFile,
+        sessionId: readSessionId(ctx) ?? sessionSessionId,
+      }));
+      const byRead = carried.reReadByRead + reReadByRead;
+      const byBash = carried.reReadByBash + reReadByBash;
+      const reReads = byRead + byBash;
       const entry = {
         schema: TELEMETRY_SCHEMA_VERSION,
         version: PACKAGE_VERSION,
@@ -533,26 +611,28 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         duration_ms: durationMs,
         start_reason: sessionStartReason,
         final_turn_count: turnCounter,
-        final_ctx_pct: null,  // captured on last context event if available; left null if unknown
+        final_ctx_pct: lastContextPct,
         zones_entered: zonesEnteredLog.slice(),
         tool_counts: toolCountsObj,
-        mask_events: contextMaskEvents,
-        unique_masks_reads: everMaskedReads.size,
-        unique_masks_bashes: everMaskedBashes.size,
+        // Schema 6: these seven add the segments before each compaction or branch change.
+        mask_events: carried.maskEvents + contextMaskEvents,
+        unique_masks_reads: carried.uniqueReads + everMaskedReads.size,
+        unique_masks_bashes: carried.uniqueBashes + everMaskedBashes.size,
         re_reads_total: reReads,
-        re_reads_by_read: reReadByRead,
-        re_reads_by_bash: reReadByBash,
-        avg_turns_held: reReads > 0 ? reReadTurnsDeltaSum / reReads : null,
+        re_reads_by_read: byRead,
+        re_reads_by_bash: byBash,
+        avg_turns_held: reReads > 0 ? (carried.reReadTurnsDeltaSum + reReadTurnsDeltaSum) / reReads : null,
         thresholds_used: config.thresholds.slice(),
         coverage_used: config.coverage.slice(),
+        // Schema 6: the responses of this run only (see runUsage).
         total_tokens_input: totalAllInput,
-        total_cache_read: totalCacheRead,
-        total_cache_write: totalCacheWrite,
-        total_output: totalOutput,
+        total_cache_read: runUsage.cacheRead,
+        total_cache_write: runUsage.cacheWrite,
+        total_output: runUsage.output,
         cache_hit_rate: cacheHitRate,
         commands_processed: totalCommands,
         commands_compressed: compressedCount,
-        bytes_freed: contextSaved,
+        bytes_freed: carried.bytesFreed + contextSaved,
         // v1.11.0 schema 2 (CM-ADR-002 §7)
         recalls_by_id: recallStats.by_id,
         recalls_by_match: recallStats.by_match,
@@ -563,6 +643,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         recall_bytes_returned: recallStats.bytes_returned,
         recall_turns_ago_sum: recallStats.turns_ago_sum,
         recall_then_rerun: recallStats.then_rerun,
+        // CM-ADR-008 §9: bash and read calls, and those that repeat an earlier call, before and after the first mask.
+        ...dupCalls.counts(),
         boundaries_applied: triggerStats.boundaries_applied,
         boundaries_skipped: triggerStats.boundaries_skipped,
         idle_advances: triggerStats.idle_advances,
@@ -588,6 +670,15 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         args_masked: argsMaskedCalls.size,
         // v1.13.1 schema 5 (CM-ADR-007)
         placeholder_calls_blocked: placeholderBlocked,
+        // v1.14.0 schema 6 (CM-ADR-008)
+        prefix_side_requests: guard.sideRequests,
+        llm_responses: runUsage.responses,
+        compactions,
+        position_resets: positionResets,
+        prefix_edits_by_role: { ...guardByRole },
+        prefix_edits_by_gap: { ...guardByGap },
+        system_edits: guardSystemEdits.slice(),
+        tools_edits: guardToolsEdits.slice(),
       };
       mkdirSync(dirname(TELEMETRY_LOG_PATH), { recursive: true });
       appendFileSync(TELEMETRY_LOG_PATH, JSON.stringify(entry) + "\n");
@@ -622,6 +713,8 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   let toolResultsCount = 0;
   let toolErrors = 0;
   let editNotFound = 0;
+  /** CM-ADR-008 §9: duplicate bash and read calls before and after the first mask. */
+  const dupCalls = newDupTracker();
 
   /** Session start: pick the features and the A/B arm (from the session id,
    *  so a resumed session keeps them) and reset the counters. */
@@ -635,48 +728,91 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     toolResultsCount = 0;
     toolErrors = 0;
     editNotFound = 0;
+    dupCalls.reset();
   }
 
   // v1.12.0 (CM-ADR-004): prefix guard. Observes each provider request and
   // never changes it; the response then tells what the change cost.
   const guard = {
     tools: 0, system: 0, messages: 0, cmMask: 0, removed: 0,
-    thinkingAtRisk: 0, droppedAfterEdit: 0, cacheWriteAfterEdit: 0, failures: 0,
+    thinkingAtRisk: 0, droppedAfterEdit: 0, cacheWriteAfterEdit: 0, failures: 0, sideRequests: 0,
   };
-  let guardPrevPayload: unknown = null;
+  /** The newest LINEAGE_MAX requests, newest first. v1.14.0 (CM-ADR-008 §4):
+   *  a request is compared with all of them, so a side request between two
+   *  main requests is not taken for an edit. */
+  let guardLineage: unknown[] = [];
   let guardPendingEdit = false;
   let guardLastEdit: PrefixChange | null = null;
-  let guardPrevDrops = new Set<string>();
+  /** Every drop path Anthropic has reported since the last history change.
+   *  v1.14.0 (CM-ADR-008): Anthropic repeats the full list on each response,
+   *  but a response with no report (an aborted call) emptied the old
+   *  "previous response" set, and the next edit counted every drop again. */
+  const guardSeenDrops = new Set<string>();
+  // v1.14.0 (CM-ADR-008): what changed, without its text.
+  /** Message edits that are not condensed-milk masks, and removals, by message class. */
+  const guardByRole: Record<MessageClass, number> = { user: 0, assistant: 0, tool_result: 0, system: 0, other: 0 };
+  /** The same edits by the number of messages after the edited one. */
+  const guardByGap = { "0": 0, "1": 0, "2_9": 0, "10_plus": 0 };
+  const guardSystemEdits: { at_turn: number; offset: number; prev_len: number; cur_len: number }[] = [];
+  const guardToolsEdits: { at_turn: number; change: "added" | "removed" | "changed" }[] = [];
 
   function resetGuard(): void {
     for (const key of Object.keys(guard) as (keyof typeof guard)[]) guard[key] = 0;
-    guardPrevPayload = null;
+    for (const key of MESSAGE_CLASSES) guardByRole[key] = 0;
+    for (const key of Object.keys(guardByGap) as (keyof typeof guardByGap)[]) guardByGap[key] = 0;
+    guardSystemEdits.length = 0;
+    guardToolsEdits.length = 0;
+    guardLineage = [];
     guardPendingEdit = false;
     guardLastEdit = null;
-    guardPrevDrops = new Set();
+    guardSeenDrops.clear();
   }
 
-  /** Count one request's prefix change and log it when CM_PREFIX_GUARD_LOG is set. */
-  function recordPrefixChange(change: PrefixChange): void {
+  /** Count one request's prefix change and log it when CM_PREFIX_GUARD_LOG is
+   *  set. `prev` and `cur` are the two payloads; their text reaches the log
+   *  only when the operator also sets CM_PREFIX_GUARD_LOG_TEXT=1. */
+  function recordPrefixChange(change: PrefixChange, prev: unknown, cur: unknown): void {
     if (change.kind === "none" || change.kind === "first" || change.kind === "unsupported") return;
     if (change.kind === "tools") guard.tools++;
     if (change.kind === "system") guard.system++;
     if (change.kind === "message") guard.messages++;
     if (change.kind === "message" && change.detail === "condensed-milk mask") guard.cmMask++;
     if (change.kind === "removed") guard.removed++;
+    noteWhatChanged(change);
     guard.thinkingAtRisk += change.thinkingAfter;
     guardPendingEdit = true;
     guardLastEdit = change;
     const logPath = process.env.CM_PREFIX_GUARD_LOG;
-    if (logPath) appendFileSync(logPath, JSON.stringify(change) + "\n");
+    if (!logPath) return;
+    const excerpt = process.env.CM_PREFIX_GUARD_LOG_TEXT === "1" ? changeExcerpt(prev, cur, change) : null;
+    appendFileSync(logPath, JSON.stringify({ ...change, turn: turnCounter, ...(excerpt ? { excerpt } : {}) }) + "\n");
+  }
+
+  /** Schema 6 (CM-ADR-008): the class and distance of an edit that is not a
+   *  condensed-milk mask, and the turn of a system or tools edit. Numbers and
+   *  fixed words only: no text, no tool name. */
+  function noteWhatChanged(change: PrefixChange): void {
+    const foreign = (change.kind === "message" && change.detail !== "condensed-milk mask") || change.kind === "removed";
+    if (foreign && change.role !== undefined && change.gap !== undefined) {
+      guardByRole[change.role]++;
+      guardByGap[gapBucket(change.gap)]++;
+    }
+    if (change.kind === "system" && change.span && guardSystemEdits.length < PREFIX_EDITS_LOGGED_MAX) {
+      guardSystemEdits.push({ at_turn: turnCounter, offset: change.span.offset, prev_len: change.span.prevLength, cur_len: change.span.curLength });
+    }
+    if (change.kind === "tools" && change.toolChange && guardToolsEdits.length < PREFIX_EDITS_LOGGED_MAX) {
+      guardToolsEdits.push({ at_turn: turnCounter, change: change.toolChange });
+    }
   }
 
   pi.on("before_provider_request", (event) => {
     try {
       const payload = (event as { payload?: unknown }).payload;
-      const change = comparePayloads(guardPrevPayload, payload);
-      if (change.kind !== "unsupported") guardPrevPayload = payload;
-      recordPrefixChange(change);
+      const { change, base } = compareWithLineage(guardLineage, payload);
+      const prev = guardLineage[base];
+      if (base > 0) guard.sideRequests += base;
+      if (change.kind !== "unsupported") guardLineage = [payload, ...guardLineage].slice(0, LINEAGE_MAX);
+      recordPrefixChange(change, prev, payload);
     } catch (e) {
       // Observation may fail (CONVENTIONS loop-bounded-observation); the
       // request must still go out unchanged. Counted and reported once.
@@ -688,18 +824,34 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     const message = (event as { message?: any }).message;
     if (message?.role !== "assistant" || !message.usage) return undefined;
+    runUsage.input += message.usage.input ?? 0;
+    runUsage.cacheRead += message.usage.cacheRead ?? 0;
+    runUsage.cacheWrite += message.usage.cacheWrite ?? 0;
+    runUsage.output += message.usage.output ?? 0;
+    runUsage.responses++;
     const drops = new Set<string>();
     for (const d of message.diagnostics ?? []) {
       for (const t of d?.details?.transformations ?? []) if (t?.type === "thinking_dropped") drops.add(String(t.path).split(".content")[0]);
     }
+    const unseen = [...drops].filter((p) => !guardSeenDrops.has(p));
     if (guardPendingEdit) {
       guard.cacheWriteAfterEdit += message.usage.cacheWrite ?? 0;
-      guard.droppedAfterEdit += [...drops].filter((p) => !guardPrevDrops.has(p)).length;
+      // An edit can drop only the blocks after it, so the blocks at risk bound the count.
+      guard.droppedAfterEdit += Math.min(unseen.length, guardLastEdit?.thinkingAfter ?? 0);
       guardPendingEdit = false;
     }
-    guardPrevDrops = drops;
+    for (const p of unseen) if (guardSeenDrops.size < DROP_PATHS_TRACKED_MAX) guardSeenDrops.add(p);
     return undefined;
   });
+
+  /** What identifies the session in telemetry: the session file when pi has
+   *  one (now, or at session start), else the session id, else nothing. */
+  function sessionKey(input: { fileAtShutdown: unknown; fileAtStart: string | undefined; sessionId: string | undefined }): string | null {
+    if (typeof input.fileAtShutdown === "string" && input.fileAtShutdown !== "") return input.fileAtShutdown;
+    if (input.fileAtStart) return input.fileAtStart;
+    return input.sessionId ? `session-id:${input.sessionId}` : null;
+  }
+  const hashSessionKey = (key: string | null) => (key === null ? null : createHash("sha256").update(key).digest("hex").slice(0, 16));
 
   function describeEdit(change: PrefixChange | null): string {
     if (!change) return "none";
@@ -792,6 +944,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     const tn = ALLOWED_TOOL_NAMES.has(rawTn) ? rawTn : "other";
     toolCounts.set(tn, (toolCounts.get(tn) ?? 0) + 1);
     noteQualityProxies(event);
+    dupCalls.note(callKey(String(event.toolName ?? ""), event.input));
     if (event.toolName === "read") {
       const path = (event.input as { path?: string })?.path;
       if (path) noteReadAgain(path);
@@ -896,6 +1049,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
     turnCounter++;
     const lastUsage = sumSessionUsage(event.messages);
     const contextUsage = readContextUsage(ctx);
+    lastContextPct = contextUsage > 0 ? contextUsage : null;
     // v1.10.1: a persisted cutoff beyond the array means the history shrank
     // under us (compaction or a branch we got no event for): reset.
     if (persistentCutoff > event.messages.length) resetPositionState();
@@ -930,7 +1084,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
       rules: USER_RULES,
       placeholderFormat: activeProfile.placeholderFormat,
       maskOldThinking: activeProfile.maskOldThinking,
-      features: { maskArgs: features.maskArgs, batchInvalidation: features.batchInvalidation },
+      features: { maskArgs: features.maskArgs, batchInvalidation: features.batchInvalidation, digest: features.digest },
       eventHorizon: maskHorizon,
     };
   }
@@ -1071,6 +1225,7 @@ export default function tokenCompressor(pi: ExtensionAPI) {
   function recordMasks(result: CompressResult): void {
     contextSaved += result.bytesSaved;
     contextMaskEvents++;
+    dupCalls.markMasked();
     for (const id of result.maskedArgCalls) argsMaskedCalls.add(id);
     for (const p of result.maskedPaths) {
       if (!everMaskedReads.has(p)) {
@@ -1164,6 +1319,9 @@ export default function tokenCompressor(pi: ExtensionAPI) {
         "",
         "Prefix guard (v1.12.0)",
         `  Prefix edits: tools ${guard.tools}, system ${guard.system}, messages ${guard.messages} (condensed-milk masks ${guard.cmMask}), removed ${guard.removed}`,
+        `  Side requests skipped: ${guard.sideRequests} (a request that continues an earlier one is not an edit)`,
+        `  Other message edits: user ${guardByRole.user}, assistant ${guardByRole.assistant}, tool result ${guardByRole.tool_result}, system ${guardByRole.system}, other ${guardByRole.other}`,
+        `  Messages after the edit: none ${guardByGap["0"]}, one ${guardByGap["1"]}, 2-9 ${guardByGap["2_9"]}, 10 or more ${guardByGap["10_plus"]}`,
         `  Thinking blocks at risk: ${guard.thinkingAtRisk} | dropped by Anthropic after an edit: ${guard.droppedAfterEdit}`,
         `  Cache written right after an edit: ${guard.cacheWriteAfterEdit} tokens`,
         `  Last edit: ${describeEdit(guardLastEdit)}`,
@@ -1421,17 +1579,19 @@ export default function tokenCompressor(pi: ExtensionAPI) {
           "condensed-milk can log per-session summaries to:",
           `  ${TELEMETRY_LOG_PATH}`,
           "",
-          "What would be recorded (per session, at graceful shutdown only):",
+          "What would be recorded (per session with at least one model call, at graceful shutdown only):",
           "  · session duration + final turn count",
           "  · pressure zones entered (turn and ctx% at each)",
           "  · tool call counts by type (read/bash/edit/grep/etc.)",
           "  · mask events, unique masks, re-reads, avg placeholder hold",
           "  · cm_recall counts (by id/match, errors, bytes returned, turns ago, re-runs after a recall)",
           "  · task-boundary and idle trigger counts, context-usage read failures",
+          "  · prefix edits: counts, kind of message, distance from the end, turn and character position (no text)",
+          "  · compactions, side requests, blocked placeholder calls",
           "  · thresholds and coverage in use",
           "  · cache hit rate + total tokens by bucket",
           "  · condensed-milk version",
-          "  · sha256-truncated hashes of session file path + cwd (16 chars)",
+          "  · sha256-truncated hashes of session file path (or session id) + cwd (16 chars)",
           "",
           "What is NOT recorded:",
           "  × ANY message or tool output content",

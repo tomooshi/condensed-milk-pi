@@ -111,12 +111,14 @@ async function pass(f, messages, tokens, entries = [], sessionId = "test-session
 	await f.fire("session_shutdown", {}, makeCtx());
 	delete process.env.CONDENSED_MILK_TELEMETRY;
 	const entry = JSON.parse(readFileSync(join(home, ".config", "condensed-milk-sessions.jsonl"), "utf-8").trim().split("\n").at(-1));
-	check("schema", entry.schema, 5);
-	check("version", entry.version, "1.13.1");
+	// test-edit: schema 6 and version 1.14.0 since CM-ADR-008; the fields below are unchanged.
+	check("schema", entry.schema, 6);
+	check("version", entry.version, "1.14.0");
 	check("session_id_hash is sha256 of the session file", entry.session_id_hash, createHash("sha256").update(SESSION_FILE).digest("hex").slice(0, 16));
 	check("blocked placeholder calls", entry.placeholder_calls_blocked, 1);
 	check("arm", entry.arm, "default");
-	check("features", entry.features, { maskArgs: true, batchInvalidation: true });
+	// test-edit (CM-ADR-009): 1.14.0 adds the digest feature to the list.
+	check("features", [entry.features.maskArgs, entry.features.batchInvalidation, Object.keys(entry.features).sort()], [true, true, ["batchInvalidation", "digest", "maskArgs"]]);
 	check("quality proxies", [entry.user_prompts, entry.tool_results, entry.tool_errors, entry.edit_not_found], [1, 2, 1, 1]);
 	check("masked-argument counter", entry.args_masked, 19);
 }

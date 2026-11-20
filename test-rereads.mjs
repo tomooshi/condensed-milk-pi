@@ -93,8 +93,8 @@ for (const m of maskedMsgs) {
   if (msg?.role !== "toolResult" || msg?.toolName !== "read") continue;
   const text = msg.content?.[0]?.text ?? "";
   if (!text.startsWith("[cm-masked read #")) continue;
-  // Expected (v1.11.0, CM-ADR-001): "[cm-masked read #<id>] /file/N.py (L lines, SIZE)"
-  const match = /^\[cm-masked read #[0-9a-f]{10}\] (\S+) \((\d+) lines, ([\d.]+(?:B|KB|MB))\)$/.exec(text);
+  // Expected (v1.14.0, CM-ADR-008): "[cm-masked read #<id>] /file/N.py (L lines, SIZE; cm_recall returns it)"
+  const match = /^\[cm-masked read #[0-9a-f]{10}\] (\S+) \((\d+) lines, ([\d.]+(?:B|KB|MB)); cm_recall returns it\)$/.exec(text);
   if (!match) { console.error("FAIL: read placeholder format", text); process.exit(1); }
   readPlaceholdersChecked++;
 }

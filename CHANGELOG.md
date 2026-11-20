@@ -2,6 +2,89 @@
 
 All notable changes to condensed-milk.
 
+## [1.14.0] - 2026-11-19
+
+Fixes from the first telemetry export that another operator shared (issue #5), compared with the maintainer's own
+log. Analysis: `docs/research/2026-11-18-field-data.md`. Decisions: CM-ADR-008.
+
+### Fixed — `cm_recall` `grep` accepts `(?i)`
+
+- A leading `(?i)`, `(?m)` or `(?s)` now moves into the RegExp flags. 8 of 12 recall errors in the export were a
+  pattern such as `(?i)wrap|close`, which JavaScript rejects. Another inline flag is an error that names the flag,
+  and every `invalid grep pattern` error says that `grep` is a JavaScript regular expression.
+
+### Fixed — condensed-milk forced the system prompt and broke the cache of other extensions' changes
+
+- The explainer was returned as `systemPrompt` from `before_agent_start`. pi treats that as a forced prompt and
+  folds every later prompt or tool change into the head of the request. Measured on real pi with a tool that becomes
+  active at the second prompt (19k-token prompt): 1.13.1 read 0 tokens from cache and wrote 19,497, then wrote
+  17,553 again on the next prompt; 1.14.0 read 19,471 and 19,736 and wrote 265 and 111. The explainer is now the
+  prompt section `condensed_milk`. It is appended as before on a pi without sections, or when an earlier extension
+  forced the prompt. This is the likely cause of the one system prompt edit per session in the shared export.
+
+### Fixed — the prefix guard took a side request for an edit
+
+- An extension that asks the model a side question sends `main request + question` through pi's hook chain. The
+  guard compared only with the newest request, so the next main request counted as "user edited": 529 of the 547
+  foreign message edits in the maintainer's log. The guard now compares with the newest 4 requests and reports the
+  one that shares the longest prefix. `/compress-stats` shows "Side requests skipped".
+- `thinking_dropped_after_edit` counted every reported drop again after a response that carried no report. A drop
+  path is now counted once, and never more than the blocks at risk of the edit.
+
+### Changed — placeholders say how to get the content back (deliberate cache bust)
+
+- Built-in placeholders end with `; cm_recall returns it`:
+  `[cm-masked bash #3f9a2c1d7e] git status (41 lines, 2.0KB; cm_recall returns it)`. In the export, about 9 sessions
+  had an agent that said it could not see a masked result and worked from memory. A session resumed after the
+  upgrade rewrites its cache once. Custom templates and the system-prompt explainer do not change.
+- A placeholder that is not shorter than the content is no longer applied.
+
+### Changed — telemetry schema 6
+
+- No row for a session with no model call (3,398 of 4,621 rows in the export).
+- `session_id_hash` is set with `--no-session` too (it hashes the session id when pi has no file).
+- Mask, byte and re-read counters add up across a compaction or a branch change; `compactions` and
+  `position_resets` count them.
+- Token totals and `cache_hit_rate` are the sum over this run's responses (`llm_responses`). Before, they summed the
+  messages in context: too low after a compaction, and counted again in each row of a resumed session.
+- `final_ctx_pct` is set.
+- New: `prefix_edits_by_role`, `prefix_edits_by_gap`, `system_edits`, `tools_edits`, `prefix_side_requests`.
+  Numbers and fixed words only: no text and no tool name.
+- Schema 6 rows are not comparable with older rows in the token totals and the mask counters.
+
+### Added
+
+- `CM_PREFIX_GUARD_LOG` lines carry the turn, the message kind, the distance from the end, and the position of a
+  system change. `CM_PREFIX_GUARD_LOG_TEXT=1` adds at most 160 characters of each side from the first difference
+  (conversation text, written only to that local file).
+- `bench/replay-cost.mjs run --reads-out` and `bench/reread-study.mjs`: which re-reads follow a mask, and what a
+  rule that keeps recently used reads would cost.
+
+### Added — placeholder digest, opt-in (CM-ADR-009)
+
+- `{"features": {"digest": true}}` makes a bash placeholder end with the result's last outcome line and a read
+  placeholder with the names the file defines (at most 120 characters, fixed code, stable bytes). On a real probe
+  the agent then needed no tool call to name two failed checks (6 of 6 runs; without the digest it called
+  `cm_recall` once). Off by default: in replay it adds 1.1% to the cache cost, above the 1% limit fixed before the
+  build.
+- `bench/probe/digest.sh`: the probe.
+
+### Added — duplicate-call counters and a share script
+
+- Telemetry: `calls_before_mask`, `dup_calls_before_mask`, `calls_after_mask`, `dup_calls_after_mask`. A bash or
+  read call is a duplicate when the same call ran earlier in the session. A higher rate after the first mask
+  shows an agent that runs things again because their output was masked. Counts only.
+- `bench/share.sh`: replay your own sessions and write two files of numbers that are safe to share.
+
+### Measured
+
+- Masking saved about 3 times its cache-write cost in the export and about 9 times in the maintainer's log.
+- Protection for recently used reads was studied and not built: on 41 replayed sessions it costs 5 to 20 times what
+  it saves, and 30 of 34 re-reads of a masked read wanted bytes the earlier result did not have.
+- A break-even test before a warm mask (arXiv 2611.22238) was built and rejected: +10.2% cache cost in replay,
+  largest prompt up to +67%. Deferring a zone only moves the rewrite to a larger request. The code is not shipped.
+- The CM-ADR-007 rule keeps masked arguments on: 0.63 and 0.23 blocked calls per 1,000 LLM calls (limit 1).
+
 ## [1.13.1] - 2026-11-07
 
 ### Fixed — a placeholder can no longer become file content (CM-ADR-007)

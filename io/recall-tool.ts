@@ -132,12 +132,12 @@ export function createRecallTool(deps: RecallToolDeps, onOutcome: (outcome: Reca
       "Return an earlier tool result exactly as it was first shown, by the #id in a `[cm-masked … #id]` " +
       "placeholder. It runs nothing: it shows the old output, not the current state (re-run the command " +
       "for that). Give `id`, or `match` (text in the command or path) to list ids. With `id`: `grep` " +
-      "(a JavaScript regular expression) keeps matching lines, `offset`/`limit` select lines, `raw` " +
+      "(a JavaScript regular expression; a leading `(?i)` ignores case) keeps matching lines, `offset`/`limit` select lines, `raw` " +
       "returns the text from before a condensed-milk filter. `session` reads another pi session (id or .jsonl path).",
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "The 10-character id from a placeholder, with or without #" })),
       match: Type.Optional(Type.String({ description: "Case-insensitive text in the tool name, command or path; lists matching ids" })),
-      grep: Type.Optional(Type.String({ description: "JavaScript regular expression; keeps only matching lines (with numbers)" })),
+      grep: Type.Optional(Type.String({ description: "JavaScript regular expression; keeps only matching lines (with numbers). A leading (?i) ignores case" })),
       offset: Type.Optional(Type.Integer({ minimum: 1, description: "First line to return (1-based)" })),
       limit: Type.Optional(Type.Integer({ minimum: 1, description: "Number of lines to return" })),
       raw: Type.Optional(Type.Boolean({ description: "Return the text from before the condensed-milk filter" })),

@@ -18,11 +18,14 @@
  *
  * Usage:
  *   node bench/replay-cost.mjs list --days 30 --max-mb 600 --out /tmp/cm-bench/list.tsv
+ *     [--sessions-dir DIR]        default: $PI_CODING_AGENT_DIR/sessions, else ~/.pi/agent/sessions
  *   node bench/replay-cost.mjs run --list list.tsv --arm base=. [--arm cand=../wt:configDir] --out run.json
+ *     [--reads-out reads.jsonl]   file touches and masks of the first arm, for bench/reread-study.mjs
+ *                                 (it holds file paths: keep it on this machine)
  * An arm is name=SOURCE_DIR[:CONFIG_DIR]. CONFIG_DIR holds condensed-milk.json and
  * condensed-milk-config.json; the default is a copy of the operator's real files.
  */
-import { createReadStream, readdirSync, statSync, mkdirSync, mkdtempSync, copyFileSync, cpSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { createReadStream, readdirSync, statSync, mkdirSync, mkdtempSync, copyFileSync, cpSync, writeFileSync, readFileSync, existsSync, appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
@@ -65,7 +68,12 @@ function args(name) {
 // ── list: a snapshot of session files and their byte lengths, so reruns read the same bytes ──
 
 function makeList() {
-	const root = join(REAL_HOME, ".pi", "agent", "sessions");
+	// --sessions-dir, else pi's agent directory (PI_CODING_AGENT_DIR, as pi itself reads it), else the default.
+	const root = resolve(arg("sessions-dir") ?? join(process.env.PI_CODING_AGENT_DIR ?? join(REAL_HOME, ".pi", "agent"), "sessions"));
+	if (!existsSync(root)) {
+		console.error(`no session directory at ${root}; pass --sessions-dir DIR (the folder that holds pi's per-project session folders)`);
+		process.exit(1);
+	}
 	const days = Number(arg("days", "30"));
 	const maxBytes = Number(arg("max-mb", "600")) * 1024 * 1024;
 	const since = Date.now() - days * 86_400_000;
@@ -300,9 +308,49 @@ function finishArmCall(r, prefixEnd, breakAt, call, state) {
 	const shocked = readPrefix(sizes, breakAt === null ? prefixEnd : Math.min(prefixEnd, breakAt), call.warm);
 	a.series.push([total.chars, total.assistantTokens, read.chars, read.assistantTokens, shocked.chars, shocked.assistantTokens]);
 	a.masked = new Set(transformed.filter((m) => m?.role === "toolResult" && textOf(m).startsWith(MASK_PREFIX)).map((m) => m.toolCallId));
+	if (state.trace && a === state.arms[0]) traceCall(state.trace, transformed, a.masked, r.armJ < call.rawJ && r.armJ < a.prev.length);
 	a.counters.masksAtLastCall = a.masked.size;
 	a.promptPrev = total.assistantTokens + total.chars / state.charsPerToken;
 	a.prev = transformed;
+}
+
+// ── optional trace of file touches and masks in the first arm (--reads-out), for bench/reread-study.mjs ──
+
+function newTrace() {
+	return { calls: 0, maskedAt: new Map(), maskEvents: [], touches: [], masked: new Set(), present: new Set(), readsByPath: new Map() };
+}
+
+/** One model call: which results the request carried and which were masked,
+ *  the call at which each result is first masked, and whether the arm edited the prefix. */
+function traceCall(trace, transformed, masked, armEdited) {
+	trace.present = new Set(transformed.filter((m) => m?.role === "toolResult").map((m) => m.toolCallId));
+	trace.masked = masked;
+	for (const id of masked) if (!trace.maskedAt.has(id)) trace.maskedAt.set(id, trace.calls);
+	if (armEdited) trace.maskEvents.push(trace.calls);
+	trace.calls++;
+}
+
+/** One successful read, edit or write result: the path, the time in calls and
+ *  the size. A read also says what the newest earlier read of the same path
+ *  was in the request that asked for this one: masked, visible, or gone
+ *  (compacted away). `trace.masked` is still that request's set here. */
+function traceTouch(trace, m, args) {
+	if (m.isError || typeof args.path !== "string" || !["read", "edit", "write"].includes(m.toolName)) return;
+	const text = textOf(m);
+	const touch = {
+		t: trace.calls, tool: m.toolName, path: args.path, id: m.toolCallId, chars: text.length,
+		range: `${args.offset ?? ""}|${args.limit ?? ""}`, hash: createHash("sha1").update(text).digest("hex").slice(0, 12),
+	};
+	if (m.toolName === "read") {
+		const earlier = trace.readsByPath.get(args.path) ?? [];
+		const prev = earlier.at(-1);
+		if (prev) {
+			const state = trace.masked.has(prev.id) ? "masked" : trace.present.has(prev.id) ? "visible" : "gone";
+			touch.prev = { id: prev.id, t: prev.t, state, sameRange: prev.range === touch.range, sameHash: prev.hash === touch.hash, chars: prev.chars };
+		}
+		trace.readsByPath.set(args.path, [...earlier, touch]);
+	}
+	trace.touches.push(touch);
 }
 
 const STRUCTURAL = new Set(["compaction", "context_edit", "branch_summary"]);
@@ -318,6 +366,7 @@ async function replaySession(path, bytes, arms, pi) {
 		restarts: 0,
 		offset: null,
 		arms: arms.map(() => ({ prev: [], valid: new Map(), masked: new Set(), promptPrev: 0, series: [], counters: { cmEdits: 0, thinkingInvalidatedByEdit: 0, thinkingInvalidatedExogenous: 0, refetchIdenticalAfterMask: 0, masksAtLastCall: 0 } })),
+		trace: arg("reads-out") ? newTrace() : null,
 	};
 	for (const arm of arms) {
 		process.env.HOME = arm.home;
@@ -373,7 +422,8 @@ async function replaySession(path, bytes, arms, pi) {
 		}
 		if (m?.role === "toolResult") await afterToolResult(e, arms, state, argsById, lastResultByKey, branch, k, byId);
 	}
-	return { calls: rec.length, restarts: state.restarts, rec, arms: state.arms.map((a) => ({ series: a.series, counters: a.counters })) };
+	const trace = state.trace ? { calls: state.trace.calls, maskEvents: state.trace.maskEvents, maskedAt: Object.fromEntries(state.trace.maskedAt), touches: state.trace.touches } : undefined;
+	return { calls: rec.length, restarts: state.restarts, rec, arms: state.arms.map((a) => ({ series: a.series, counters: a.counters })), trace };
 }
 
 /** Feed a bash result to each arm (boundary detection) and count identical re-fetches of masked results. */
@@ -386,6 +436,7 @@ async function afterToolResult(e, arms, state, argsById, lastResultByKey, branch
 			await arm.fire("tool_result", { toolName: "bash", toolCallId: m.toolCallId, input: args, content: m.content ?? [], details: m.details, isError: m.isError === true }, minimalCtx(branch, k, byId, undefined));
 		}
 	}
+	if (state.trace) traceTouch(state.trace, m, args);
 	const key = m.isError ? null : toolKey(e, argsById);
 	if (key === null) return;
 	const hash = createHash("sha1").update(textOf(m)).digest("hex");
@@ -443,6 +494,8 @@ async function run() {
 	});
 	if (specs.length === 0) throw new Error("run: at least one --arm name=SOURCE_DIR is required");
 	const out = resolve(arg("out", "/tmp/cm-bench/run.json"));
+	const readsOut = arg("reads-out") ? resolve(arg("reads-out")) : null;
+	if (readsOut) writeFileSync(readsOut, "");
 	const realDate = Date.now;
 	isolateHome();
 	process.env.CONDENSED_MILK_TELEMETRY = "off";
@@ -455,7 +508,10 @@ async function run() {
 	const sessions = [];
 	for (const [i, [path, bytes]] of list.entries()) {
 		const t0 = realDate();
-		sessions.push({ index: i, ...(await replaySession(path, Number(bytes), arms, pi)) });
+		const { trace, ...session } = await replaySession(path, Number(bytes), arms, pi);
+		sessions.push({ index: i, ...session });
+		// Paths stay on this machine: the trace goes to its own file, never into the run file.
+		if (trace && readsOut) appendFileSync(readsOut, JSON.stringify({ index: i, ...trace }) + "\n");
 		process.stderr.write(`  session ${i + 1}/${list.length}: ${sessions.at(-1).calls} calls, ${((realDate() - t0) / 1000).toFixed(1)}s\n`);
 	}
 	globalThis.Date.now = realDate;

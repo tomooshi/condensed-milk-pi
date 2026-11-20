@@ -36,7 +36,8 @@ export type ThinkingMaskPolicy = "off" | "with-coverage" | "above-cutoff";
  *  `{id}` still works; resolveProfile warns that its results cannot be
  *  recalled by id. */
 export interface PlaceholderTemplates {
-  /** Substituted: {id}, {cmd} = first 80 chars of the bash command, {n}, {size}. */
+  /** Substituted: {id}, {cmd} = first 80 chars of the bash command, {n}, {size},
+   *  {digest} = `: <outcome lines>` or nothing (v1.14.0, bash and read only). */
   bash: string;
   /** Substituted: {id}, {path}, {n} (line count), {size} (formatted size). */
   read: string;
@@ -48,12 +49,16 @@ export interface PlaceholderTemplates {
   arg: string;
 }
 
-/** CM-ADR-001 default templates, shared by both built-in profiles. */
+/** CM-ADR-001 default templates, shared by both built-in profiles.
+ *  v1.14.0 (CM-ADR-008): each one ends with `; cm_recall returns it`. In the
+ *  field some agents read a placeholder as lost content and worked from
+ *  memory; the way back is now in the placeholder, not only in the system
+ *  prompt. This changed the bytes once, a deliberate cache bust. */
 export const DEFAULT_PLACEHOLDERS: PlaceholderTemplates = {
-  bash: "[cm-masked bash #{id}] {cmd} ({n} lines, {size})",
-  read: "[cm-masked read #{id}] {path} ({n} lines, {size})",
-  recall: "[cm-masked recall #{id}] {cmd} ({n} lines, {size})",
-  arg: "[cm-masked arg #{id}] {cmd} ({n} lines, {size})",
+  bash: "[cm-masked bash #{id}] {cmd} ({n} lines, {size}; cm_recall returns it){digest}",
+  read: "[cm-masked read #{id}] {path} ({n} lines, {size}; cm_recall returns it){digest}",
+  recall: "[cm-masked recall #{id}] {cmd} ({n} lines, {size}; cm_recall returns it)",
+  arg: "[cm-masked arg #{id}] {cmd} ({n} lines, {size}; cm_recall returns it)",
 };
 
 /** Profile shape — every backend-specific knob in one place. */
@@ -284,7 +289,7 @@ function validateMonotonic(arr: readonly number[] | undefined, ctx: string, warn
  *  uses a token we don't substitute (e.g. `{stderr}`) just shows literally. */
 export function renderPlaceholder(
   template: string,
-  vars: { id?: string; cmd?: string; path?: string; n?: number; size?: string },
+  vars: { id?: string; cmd?: string; path?: string; n?: number; size?: string; digest?: string },
 ): string {
   // Function replacers: a `$&` or `$1` inside a command or path must stay literal.
   return template
@@ -292,5 +297,7 @@ export function renderPlaceholder(
     .replace(/\{cmd\}/g, () => vars.cmd ?? "")
     .replace(/\{path\}/g, () => vars.path ?? "")
     .replace(/\{n\}/g, () => (vars.n !== undefined ? String(vars.n) : ""))
-    .replace(/\{size\}/g, () => vars.size ?? "");
+    .replace(/\{size\}/g, () => vars.size ?? "")
+    // v1.14.0 (CM-ADR-009): `: <digest>`, or nothing when there is none or the feature is off.
+    .replace(/\{digest\}/g, () => (vars.digest ? `: ${vars.digest}` : ""));
 }

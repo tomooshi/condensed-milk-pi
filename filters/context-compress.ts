@@ -41,6 +41,7 @@
  */
 
 import type { PlaceholderTemplates, ThinkingMaskPolicy } from "./profiles.js";
+import { digestBash, digestRead } from "./digest.js";
 import { renderPlaceholder, DEFAULT_PLACEHOLDERS } from "./profiles.js";
 import { countLines, formatSize, shortId } from "./text-metrics.js";
 import { recallLabel } from "./recall.js";
@@ -331,6 +332,8 @@ export interface CompressOptions {
 export interface MaskFeatures {
   maskArgs?: boolean;
   batchInvalidation?: boolean;
+  /** v1.14.0 (CM-ADR-009): add a digest to bash and read placeholders. */
+  digest?: boolean;
 }
 
 
@@ -539,14 +542,16 @@ function maskBash(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): MaskO
     isCommandInvalidated(command, scope.messages, t.idx, scope.toolCallIndex, scope.rules, scope.invalidationLimit);
   if (!t.pastCutoff && !invalidated) return null;
   const cmd = command ? command.slice(0, PLACEHOLDER_COMMAND_CHARS_MAX) : UNKNOWN_COMMAND;
-  return applyMask(t.m, t.content, renderPlaceholder(scope.templates.bash, { ...vars, cmd }), { command: command || undefined });
+  const digest = scope.features.digest ? digestBash(t.content) : "";
+  return applyMask(t.m, t.content, renderPlaceholder(scope.templates.bash, { ...vars, cmd, digest }), { command: command || undefined });
 }
 
 /** Read: masked past the cutoff unless the path is a reference file. */
 function maskRead(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): MaskOutcome | null {
   const path = extractPath(t.msg, scope.toolCallIndex);
   if (!path || !t.pastCutoff || isReferenceFile(path, scope.rules)) return null;
-  return applyMask(t.m, t.content, renderPlaceholder(scope.templates.read, { ...vars, path }), { path });
+  const digest = scope.features.digest ? digestRead(t.content, path) : "";
+  return applyMask(t.m, t.content, renderPlaceholder(scope.templates.read, { ...vars, path, digest }), { path });
 }
 
 /** cm_recall: masked past the cutoff, labelled with its arguments (CM-ADR-002 §3). */
@@ -556,8 +561,12 @@ function maskRecall(t: MaskTarget, vars: PlaceholderVars, scope: MaskScope): Mas
   return applyMask(t.m, t.content, renderPlaceholder(scope.templates.recall, { ...vars, cmd }), {});
 }
 
-/** Replace a result's content with its placeholder and report what it saved. */
-function applyMask(m: any, content: string, placeholder: string, what: { command?: string; path?: string }): MaskOutcome {
+/** Replace a result's content with its placeholder and report what it saved.
+ *  v1.14.0 (CM-ADR-008): null when the placeholder is not shorter than the
+ *  content (a long command or path on a result just over MIN_MASK_LENGTH);
+ *  such a mask would add bytes and hide the text. Same rule as maskArgs. */
+function applyMask(m: any, content: string, placeholder: string, what: { command?: string; path?: string }): MaskOutcome | null {
+  if (placeholder.length >= content.length) return null;
   return { message: replaceContent(m, placeholder), bytesSaved: content.length - placeholder.length, ...what };
 }
 

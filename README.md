@@ -42,13 +42,22 @@ Pi's `context` event fires before every LLM call with a deep copy of the convers
 
 **Algorithm (v1.2.0+ static cutoff, ADR-018):** a cutoff index T advances only when context usage crosses a pressure threshold. Between advances T is immutable — bytes before T stay byte-identical turn-over-turn — cache prefix stable. Defaults (v1.7.0): thresholds `[0.30, 0.45, 0.60]` of context used, coverage `[0.60, 0.80, 0.95]` of messages masked at each zone.
 
-**Placeholders (v1.11.0, CM-ADR-001):**
+**Placeholders (v1.11.0, CM-ADR-001; v1.14.0, CM-ADR-008):**
 
-- `[cm-masked bash #3f9a2c1d7e] <command, first 80 chars> (N lines, SIZE)` — bash results
-- `[cm-masked read #3f9a2c1d7e] <path> (N lines, SIZE)` — read results
-- `[cm-masked recall #3f9a2c1d7e] <recall arguments> (N lines, SIZE)` — `cm_recall` results
+- `[cm-masked bash #3f9a2c1d7e] <command, first 80 chars> (N lines, SIZE; cm_recall returns it)` — bash results
+- `[cm-masked read #3f9a2c1d7e] <path> (N lines, SIZE; cm_recall returns it)` — read results
+- `[cm-masked recall #3f9a2c1d7e] <recall arguments> (N lines, SIZE; cm_recall returns it)` — `cm_recall` results
 
-The `#id` is the first 10 hex characters of `sha1(toolCallId + "\0" + timestamp)`, so it never changes and the cache stays stable. The `cm-` prefix brands the placeholder as a condensed-milk artifact so fresh agents don't misread it as a tool failure. A constant explainer is appended to every turn's system prompt via `before_agent_start`: it tells the agent to call `cm_recall` with the id for the output as it was, and to re-run the command for the current state. Legacy `[masked …]` and id-less `[cm-masked …]` placeholders in older session files are still recognized as masked.
+Since v1.14.0 each placeholder names `cm_recall`, because some agents read a placeholder as lost content. A result is
+masked only when the placeholder is shorter than it.
+
+**Digest (v1.14.0, CM-ADR-009, opt-in).** With `{"features": {"digest": true}}` in `~/.config/condensed-milk.json`, a
+bash placeholder ends with the result's last outcome line and a read placeholder with the names the file defines:
+`[cm-masked bash #3f9a2c1d7e] npm test (412 lines, 18KB; cm_recall returns it): Tests 2 failed | 87 passed (89)`.
+The digest comes from fixed code and has at most 120 characters. It saves a `cm_recall` call when the agent needs
+only that fact, and it adds about 1% to the cache cost, so it is off by default.
+
+The `#id` is the first 10 hex characters of `sha1(toolCallId + "\0" + timestamp)`, so it never changes and the cache stays stable. The `cm-` prefix brands the placeholder as a condensed-milk artifact so fresh agents don't misread it as a tool failure. A constant explainer is added to the system prompt via `before_agent_start` (since v1.14.0 as the prompt section `condensed_milk`, so pi does not force the whole prompt): it tells the agent to call `cm_recall` with the id for the output as it was, and to re-run the command for the current state. Legacy `[masked …]` and id-less `[cm-masked …]` placeholders in older session files are still recognized as masked.
 
 ### Recall: `cm_recall` (v1.11.0, CM-ADR-002)
 
@@ -57,6 +66,7 @@ Masking hides old results; it does not delete them. pi keeps every original in t
 ```
 cm_recall({ id: "#3f9a2c1d7e" })                  # the original, exactly as first shown
 cm_recall({ id: "3f9a2c1d7e", grep: "FAILED" })   # matching lines, with line numbers
+cm_recall({ id: "3f9a2c1d7e", grep: "(?i)failed" })  # v1.14.0: a leading (?i), (?m) or (?s) is accepted
 cm_recall({ id: "3f9a2c1d7e", offset: 200, limit: 50 })
 cm_recall({ id: "3f9a2c1d7e", raw: true })        # the text from before a condensed-milk filter
 cm_recall({ match: "git status" })                # list ids (newest first, at most 10)
@@ -103,7 +113,7 @@ An edit or write call carries the whole text it changes, and a heredoc bash call
 call ran, the file holds that text, yet every later request sent it again. In 1.13.0, past the cutoff:
 
 - each string argument of an edit or write call of 240+ characters, and a bash command of 2,048+ characters,
-  becomes `[cm-masked arg #3f9a2c1d7e] edit edits[0].oldText (81 lines, 3.2KB)`. `path` and short values stay;
+  becomes `[cm-masked arg #3f9a2c1d7e] edit edits[0].oldText (81 lines, 3.2KB; cm_recall returns it)`. `path` and short values stay;
   reference files stay. `cm_recall` with the id returns the arguments byte-identical.
 - bash invalidation (the built-in `git add` → `git status` rules, or your own) waits for the next mask event
   instead of editing the prompt mid-run.
@@ -138,7 +148,13 @@ its earlier reasoning (thinking blocks after the change) and rewrites the prompt
 
 The guard only observes; the request is never changed. `/compress-stats` shows the counts, the thinking blocks at
 risk and those Anthropic reported as dropped, and the last change. Set `CM_PREFIX_GUARD_LOG=/path/file.jsonl` to get
-one JSON line per change.
+one JSON line per change: the kind, the turn, the kind of message, the number of messages after it, and for a system
+prompt the first character that differs. Add `CM_PREFIX_GUARD_LOG_TEXT=1` to also get at most 160 characters of each
+side from the first difference. That is conversation text; it goes only to that file.
+
+A side request is not an edit (v1.14.0, CM-ADR-008). Some extensions ask the model a side question: they send the
+main request plus a question. The guard compares each request with the newest 4 requests, so the main request that
+follows is not counted. `/compress-stats` shows how many side requests it skipped.
 
 ### Compound Command Handling
 
@@ -202,7 +218,7 @@ The extension works automatically — no configuration needed. Every bash comman
 | `/compress-stats` | Show compression + masking statistics for the current session, including re-read telemetry (v1.4.0) |
 | `/compress-config` | Show or update thresholds/coverage/statusbar (`thresholds 0.15,0.30,0.45`, `coverage 0.5,0.75,0.9`, `status on\|off`) |
 | `/compress-profile` | Show or switch the active backend profile (v1.10.0). `/compress-profile qwen-vllm` switches; takes effect on next session. |
-| `/compress-telemetry` | Opt-in local session telemetry (schema 2 since v1.11.0: recall and trigger counters). |
+| `/compress-telemetry` | Opt-in local session telemetry (schema 6 since v1.14.0). |
 | `/cm-boundary` | v1.11.0: mark the end of a task; the next model call masks every result the model has seen (if that frees at least 32 KB). |
 
 The extension also registers one tool for the model: `cm_recall` (see [Recall](#recall-cm_recall-v1110-cm-adr-002)).
@@ -337,7 +353,13 @@ by match, errors, bytes returned, turns ago, re-runs after a recall),
 task-boundary and idle trigger counts, and context-usage read failures. Schema 3
 (v1.12.0) adds prefix-guard counts. Schema 4 (v1.13.0) adds the A/B arm, the
 feature flags, user prompts, tool results, tool errors, failed edits ("could
-not find") and masked-argument counts.
+not find") and masked-argument counts. Schema 5 (v1.13.1) adds blocked
+placeholder calls. Schema 6 (v1.14.0, CM-ADR-008) writes no row for a session
+with no model call, keeps the mask counters across a compaction, takes the
+token totals from this run's responses, and adds compaction counts, side
+requests, and for prefix edits the kind of message, its distance from the end,
+and the turn and character position of a system or tools edit. Schema 6 rows
+are not comparable with older rows in the token totals and the mask counters.
 
 **What's NOT recorded:** any message or tool output content, file paths,
 commands, tool inputs or `cm_recall` arguments (only hashes), environment
